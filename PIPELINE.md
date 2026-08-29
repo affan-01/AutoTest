@@ -113,6 +113,14 @@ output path over the paths guessed here.
   per-value reconciliation). Verifying the file only by unzipping/parsing it is insufficient evidence —
   the reviewer needs to see both the source UI and the exported artifact. Keep the downloaded file in
   the execution folder so the side-by-side can be regenerated.
+- **Credential handling is a hard requirement, not a courtesy.** Live-login runs have leaked decodable
+  credentials twice despite an explicit "don't log it" instruction — via channels that never hit stdout
+  (shell env-var exports, base64-decode commands, Chrome's save-password prompt). "Don't print it" is
+  not sufficient; the execution agent's own file now enforces the full list (never route the raw/base64
+  value through a Bash/PowerShell tool call, decode in-model and pass straight into the form field,
+  never save-password, never write it to scratch/log files). See `manual-test-execution-agent.md` Step 2
+  and memory `manual-test-agent-credential-leak-pattern`. If you're briefing this stage manually instead
+  of letting the agent run its own instructions, repeat that list in the prompt.
 
 ### Stage 6 — DB verification (preview)  *(HARD when the feature has backend state; else SOFT)*
 - **No agent — Claude does this directly.** Connect to preview and confirm the backend actually
@@ -122,7 +130,16 @@ output path over the paths guessed here.
   Correlate rows by a tag written during execution (e.g. a Notes value like `QA<id>-TCxx`).
   Big tables (`opsfile`, etc.): always filter on `lastmodified` and use `NOLOCK`, or queries
   time out. For invoice XML lookups see `ops-invoice-xml-where-in-merchant`.
-- **Done when:** each executed TC has a recorded DB verdict (pass/fail + the evidence row).
+- **No SQL login for this app's DB? Fall back to captured API responses as the source of truth**,
+  don't skip Stage 6 or downgrade it to SOFT. This has already happened for the Spend Insights
+  Report Catalog (`RRI\maffan` has no login on `rcvoptdbsql002/spendinsightpreview` — see memory
+  `spendinsight-reportcatalog-db`): capture the actual backend request/response (e.g. the
+  `POST/DELETE /favorite` call and its 200 body, or a `/search` count) during live execution and
+  cite that response as the DB verdict's evidence instead of a row. Note in the report that this
+  was API-tier, not row-level, verification, and flag it as a follow-up to request read-only DB
+  access if this app recurs.
+- **Done when:** each executed TC has a recorded DB verdict (pass/fail + the evidence row, or the
+  API-response evidence per the fallback above).
 
 ### Stage 7 — Report  *(always runs)*
 - **No agent — synthesize natively.** Read the Stage 5 summary.json + Stage 6 verdicts and write
@@ -153,6 +170,16 @@ output path over the paths guessed here.
   `tfs-rest-auth-windows-integrated`, `tfs-create-testcase-and-link-to-story`, and the evidence
   embedding recipe + gotchas in `us2979947-docsplit-qa-pipeline` (upload attachment → `<img>`
   in System.History; helpers must use `Write-Host` not `Write-Output` or the URL corrupts).
+- **Execute every write as an inline PowerShell command — never `&`-invoke a saved `.ps1` for the
+  actual create/PATCH/attachment calls.** Script-file invocation against this TFS server is
+  unreliable (intermittent malformed-HTML "Page not found" responses on `Invoke-RestMethod` calls
+  that succeed when typed inline — root cause smells like an NTLM/`-UseDefaultCredentials`
+  auth-context quirk, not a generic bug); one focused inline block per write was 100% reliable
+  across ~15 sequential writes in practice. Drafting the logic in a script file first is fine —
+  just don't execute the real writes that way. Also watch for `ConvertTo-Json` silently collapsing
+  a single-element patch array to a bare object (TFS rejects it with `VssPropertyValidationException`
+  — build the array string manually for 1-item patches). See memory
+  `powershell-tfs-write-reliability`.
 - **Never overwrite** a populated `testCaseIds` / existing test case — append only.
 
 ---

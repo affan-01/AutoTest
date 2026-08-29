@@ -1,130 +1,122 @@
 # QA pipeline — two ways to run
 
-There are two implementations of the QA pipeline in this folder. **They are not equivalent** —
-pick the one that matches what you're doing.
+Two implementations live here. **They are not equivalent** — pick the one that matches what you're doing.
 
-## 1. Interactive playbook — `PIPELINE.md`  ← the real, full sequence
+## 1. Interactive playbook — `PIPELINE.md` ← the real, full sequence
 
-This is the canonical, authoritative definition of the end-to-end QA sequence and the one that
-reflects how testing is actually conducted here. Claude drives it inside a live Claude Code
-session (live browser, live DB, judgement calls). Trigger it with:
+Claude drives this live inside a Claude Code session (live browser, live DB, judgement calls).
 
 ```
 run QA pipeline on <story-id>      (or)      /qa-pipeline <story-id>
 ```
 
 Stages: **groom+evaluate → PR impact → CCT cross-center impact → generate → execute live →
-DB verification (preview) → report → publish to TFS (one confirmation gate)**. It auto-detects
-the environment from the story's linked PR branch and needs only the work-item id. See
-`PIPELINE.md` for the full spec and standing preferences; `.claude/commands/qa-pipeline.md` is
-the thin router that loads it.
+DB verification (preview) → report → publish to TFS (one confirmation gate)**. Auto-detects the
+environment from the story's linked PR branch; needs only the work-item id.
 
-**To change the sequence, edit `PIPELINE.md`** — not this README, not the command.
+**To change the sequence, edit `PIPELINE.md`** — not this file, not the command.
 
-## 2. Headless Python script — `flow.py`  (partial, never run end-to-end)
-
-`python3 -m pipelines.flow --story-id <id> [--pr-id <id>]` runs a *subset*:
+## 2. Headless script — `flow.py` (partial, never run end-to-end)
 
 ```
-groom -> impact (only if --pr-id given) -> generate -> execute -> report
+python3 -m pipelines.flow --story-id <id> [--pr-id <id>]
 ```
 
-It is deliberately narrower than the interactive playbook: **no CCT stage, no DB verification,
-and it does not publish to TFS** (no `--publish` flag, no PR comments, no test-result uploads).
-Artifacts land in `artifacts/flow/<story_id>/`. Use it only for an unattended groom/generate
-subset — not as a substitute for the full `PIPELINE.md` run. It has not been run end-to-end;
-see "Known risks / not yet verified" below.
+A narrower subset — **no CCT stage, no DB verification, no TFS publish** (no `--publish` flag, no
+PR comments, no test-result uploads). Every stage delegates to the same agents the slash-commands
+use (`.claude/agents/*.md`). Artifacts land in `artifacts/flow/<story_id>/`.
 
-## What this actually wires up, vs. the original draft it was built from
+### Call flow (`flow.py::main`)
 
-This was authored from a handoff spec that assumed a `qa-pipelines/pipelines/flow.py` would
-already exist somewhere on disk. It did not — it wasn't in this repo, and the only "qa" folder
-in Downloads was an unrelated Node/TypeScript project. This was written from scratch against the
-real `.claude/commands/*.md` and `.claude/agents/*.md` files, on 2026-07-11. Corrections made
-along the way:
+```mermaid
+flowchart TD
+    Start(["python -m pipelines.flow<br/>--story-id ID [--pr-id PR]"]) --> Groom
 
-1. **Argument style.** All of groom-story, analyze-pr, review-pr, generate-tests,
-   analyze-report pass `$ARGUMENTS` straight through as the agent's prompt via
-   `Task(subagent_type=...)` — free text, not flags. `analyze-pr` additionally accepts inline
-   `key=value` pairs (`project=`, `repo=`, `planId=`, `suiteId=`) in that same string.
-   `execute-tests` is the odd one out: it's a positional `<planId> <suiteId> [testCaseId] [env]`
-   skill invocation, not a Task-based agent call.
+    Groom["stage_groom()<br/>Task → user-story-groomer<br/>writes grooming-reports/"]
+    Groom --> HasPR{"--pr-id given?"}
 
-2. **Execution stage.** `manual-test-execution-agent.md` does drive a real browser via
-   Playwright MCP (`browser_navigate`, `browser_click`, `browser_snapshot`, etc.) — that part of
-   the original assumption held. But its `tools:` frontmatter also requires
-   `mcp__rp-azure-devops__*` and `mcp__rpdevops__*` for TC discovery and environment
-   auto-detection (Steps 0.5/0.75 in that file). A Playwright-only allowlist would break TC
-   discovery. `flow.py`'s `EXECUTE_TOOLS` includes all three.
+    HasPR -- no --> Generate
+    HasPR -- yes --> Impact
 
-   Also: this pipeline calls the agent directly with a bare story id (Work-Item Mode), not the
-   `/execute-tests` skill/command, because that skill requires `planId`+`suiteId` which nothing
-   upstream in this flow produces. The agent's own Work-Item Mode already does TFS-linked →
-   local-bunker discovery, which lines up with what `generate` just wrote.
+    Impact["stage_impact()<br/>Task → pr-impact-analyzer<br/>writes pr-analysis-reports/"]
+    Impact --> ImpactOK{"impact-report.md found?<br/>(a dropped .py/.ps1 fallback script = FAIL)"}
+    ImpactOK -- no --> Stop1["stage_report() → NO-SHIP<br/>(impact incomplete)"] --> Exit1(["exit 1"])
+    ImpactOK -- yes --> Generate
 
-3. **MCP server registration.** `.claude/settings.local.json` already has
-   `"enabledMcpjsonServers": ["playwright"]` sourced from this repo's `.mcp.json`. `flow.py`
-   does not re-register a Playwright MCP server — `setting_sources=["project"]` picks it up.
-   **Open question, not resolved:** `mcp__rp-azure-devops__*` / `mcp__rpdevops__*` are NOT in
-   this repo's `.mcp.json`, so they must be registered at user/global scope. Whether
-   `setting_sources=["project"]` also inherits user-scope MCP servers, or whether the execute
-   stage needs those servers passed explicitly via `mcp_servers=`, was not verified — the
-   `claude_agent_sdk` package isn't installed yet in this environment. Verify this before
-   trusting a real execute-stage run; if TFS MCP calls silently no-op, this is why.
+    Generate["stage_generate()<br/>Task → test-case-generation-agent<br/>writes bunker/test-case-reports/"]
+    Generate --> GenOK{"*-tests.testsuite.json found?"}
+    GenOK -- no --> Stop2["stage_report() → NO-SHIP<br/>(no test cases generated)"] --> Exit2(["exit 1"])
+    GenOK -- yes --> Execute
 
-4. **Credentials.** The handoff draft assumed `TFS_PAT`. The real convention already in use in
-   this repo (`.claude/agent-memory/pr-impact-analyzer/auth-and-api-versions.md`) is `ADO_PAT` +
-   `TFS_ORG_URL` read from a `.env` file — `pipelines/common.py` uses those names instead. Also
-   worth knowing: per that same agent's memory, the stored PAT is currently reported dead (401
-   on everything) and TFS calls fall back to **Windows Integrated Auth** on this machine. That
-   means for local runs under your own Windows session, TFS access may work with **no PAT env
-   var set at all**. For the execute stage specifically, `manual-test-execution-agent.md`
-   resolves app login credentials itself (explicit input → TFS test-case parameters →
-   `src/test/resources/env/{sat,qa}.properties`) — it does not need `QA_TEST_USER` /
-   `QA_TEST_PASSWORD` env vars passed in the way the original draft assumed.
+    Execute["stage_execute()<br/>Task → manual-test-execution-agent<br/>(Work-Item Mode)<br/>writes bunker/manual-test-execution/"]
+    Execute --> Report
 
-5. **The final "report" stage does not call `automation-report-analyzer` / `/analyze-report`.**
-   That agent is grounded in *Extent* HTML reports from the Selenium/TestNG suites
-   (`mvn test` runs) — a different report shape than what `manual-test-execution-agent`
-   produces (its own HTML/PDF + `*-summary.json`). `stage_report()` in `flow.py` reads that
-   summary.json directly and writes `qa-report.md` natively instead of routing through a
-   mismatched agent. `automation-report-analyzer` is still the right tool if you separately want
-   to analyze an actual automation regression run — just not as this pipeline's last stage.
+    Report["stage_report()<br/>no agent — reads execute's summary.json directly<br/>writes qa-report.md"]
+    Report --> Final{"execute.ok?"}
+    Final -- yes --> Exit0(["exit 0"])
+    Final -- no --> Exit3(["exit 1"])
+```
 
-6. **`generate-tests.md`'s documented "Execute `npm run smart-generate <userstoryid>`" step
-   does not apply to this repo** — there is no `package.json` here; this is a Maven/Java repo.
-   That line in the command doc looks like it was copied from a different (Node-based) project
-   template and never adjusted. `flow.py` does not attempt to run that npm command; it invokes
-   `test-case-generation-agent` directly, which per its own description grounds generation in
-   this repo's page objects and TFS data, not an npm script. Worth fixing the command doc
-   itself separately.
+`stage_report()` never calls an agent and never auto-approves a ship decision — it just synthesizes
+`qa-report.md` from what the prior stages produced.
 
-## Known risks / not yet verified
+## Quality evals (opt-in, off by default)
 
-- **`claude_agent_sdk` 0.2.116 is now installed and `common.py`'s field names were checked
-  against it directly** (`dataclasses.fields(ClaudeAgentOptions)` + `inspect.signature(query)`):
-  `allowed_tools`, `permission_mode`, `max_turns`, `setting_sources`, `cwd` all exist as used.
-  `query()` yields `UserMessage | AssistantMessage | SystemMessage | ResultMessage | StreamEvent
-  | RateLimitEvent` — `run_agent()` now only pulls text from `AssistantMessage.content` blocks
-  (not `UserMessage.content`, which carries tool-result payloads, not the agent's own text) and
-  surfaces `ResultMessage.is_error`/`.result` if the query itself errored.
-- **`max_turns` budgets are rough guesses** (40 for groom/impact, 80 for generate, 200 for
-  execute) — the execute stage in particular can run many test cases each requiring several
-  Playwright round-trips per step; expect to tune this upward after watching a real suite run.
-- **The impact stage's sandboxed-shell fallback is a hard stop, not a workaround.** If
-  `pr-impact-analyzer` can't reach TFS directly from this process, `flow.py` reports FAILED
-  rather than trying to execute the fallback script itself — that fallback is designed for a
-  human in the loop, and this is intentionally not simulating that.
-- **`permission_mode="bypassPermissions"` is used for every stage** so the flow can run
-  unattended end to end. This should only ever point at sandbox data / non-prod environments —
-  it removes the human-approval gate that normally protects against an agent taking an
-  unintended action.
+`pipelines/evals.py` wires two deepeval LLM-judge metrics into `flow.py`, picked to guard the
+pipeline's two costliest failure modes rather than built as a general framework:
 
-## Not done here (by design)
+- **Groundedness** (a custom G-Eval) on `stage_generate` — judges the generated test cases
+  against the story's real acceptance criteria (read from `stage_groom`'s `.md` artifact), to
+  catch invented screens/fields/business rules.
+- **Summarization** on `stage_report` — judges `qa-report.md` against `execution_log.json`, to
+  catch a ship/no-ship writeup that misrepresents what execution actually found.
 
-- No `azure/qa-flow.yml` or any other Azure DevOps pipeline/service-hook/variable-group changes.
-- No `--publish` mode, no TFS writes, no PR comments.
-- No packages installed, no env vars set, no dry run executed — this pipeline has been written
-  and grounded against the real agent files, but not yet run. `pip install claude-agent-sdk`
-  and any real dry run needs an explicit go-ahead since it involves installing software and
-  (for stages beyond groom/generate) potentially touching credentials.
+Both are **report-only, not a gate** — a low score is logged to stdout and to the run's
+`trace.jsonl` (under each stage's span metadata), but does not fail the stage or flip the
+ship/no-ship call. Thresholds are the deepeval defaults (0.5), uncalibrated against any real run
+so far; treat scores as a new signal to watch, not a verdict to trust yet.
+
+**The judge model is NOT deepeval's built-in `AnthropicModel`.** That requires a standalone
+Anthropic Console API key, and RealPage's Claude Console org has self-serve key creation
+disabled (org admins declined to enable it for this use case, 2026-08-28). Instead
+`pipelines/evals.py::_ClaudeAgentSdkModel` is a small custom `DeepEvalBaseLLM` that reuses the
+SAME Claude Agent SDK auth every other stage in this pipeline already depends on — no separate
+key needed. One live wrinkle it works around: if `ANTHROPIC_API_KEY` happens to be set in the
+shell (even to an invalid value), the Claude CLI's own precedence rules make it shadow the
+working claude.ai login and the call hangs/fails — verified in this exact environment. The model
+passes `env={"ANTHROPIC_API_KEY": ""}` to neutralize that for just its own subprocess, without
+touching the calling process's environment. This is scoped to the eval judge only — it is
+deliberately NOT applied in `pipelines/common.py::run_agent`'s four real pipeline stages; if you
+hit the same shadowing symptom there, that's a separate call to make, not an automatic fix.
+
+Enable with:
+
+```powershell
+$env:PIPELINE_EVALS = "1"                      # off unless set — every call is a real judge request
+$env:PIPELINE_EVAL_MODEL = "claude-sonnet-5"   # optional override, this is already the default
+```
+
+No API key to set — auth comes from the same Claude Agent SDK login `run_agent` already uses.
+If `PIPELINE_EVALS=1` but `claude_agent_sdk` isn't installed, the judge call isn't authenticated,
+or it fails for any other reason (rate limit, network, `max_turns` cutoff), each eval degrades to
+an `EvalOutcome(success=False, score=None, reason="eval judge call failed: ...")` — it never
+raises into the stage. `None` (not attempted — evals disabled) and a `success=False` outcome
+(attempted, and either judged ungrounded/unfaithful or the judge call itself failed) are
+distinguished in `reason`, so a disabled-evals run and a failed-judge-call run don't look alike
+in the trace.
+
+Note deepeval has its own PostHog analytics call on `metric.measure()` (observed as a
+"[PostHog] analytics lane flush" message) — unrelated to the Anthropic judge call, and not
+something this seam controls; it is deepeval's own library telemetry, not TFS/PR content.
+
+## Known risks (flow.py only)
+
+- Never run end-to-end. Field names were checked against the installed `claude_agent_sdk`, but that's static verification, not a real run.
+- `max_turns` (40 groom/impact, 80 generate, 200 execute) are rough guesses — `stage_execute` especially can need more given per-step Playwright round-trips.
+- Runs every stage with `permission_mode="bypassPermissions"` — point this only at sandbox/non-prod data.
+- Treats the impact stage's sandboxed-shell fallback (agent writes a script for a human to run) as a hard failure rather than simulating that human.
+
+## Not done here
+
+No Azure DevOps pipeline/service-hook changes, no `--publish` mode, no TFS writes, no PR comments,
+no packages installed or env vars set beyond what's documented above.
