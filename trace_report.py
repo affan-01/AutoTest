@@ -100,6 +100,17 @@ def render(trace: dict) -> None:
             print(f"{pad}    artifacts: {m['artifact_count']}")
             for a in (m.get("new_artifacts") or [])[:6]:
                 print(f"{pad}      - {a}")
+        if m.get("artifact_wait_ms"):
+            print(f"{pad}    waited: {_fmt_ms(m['artifact_wait_ms'])} for the artifact to appear "
+                  f"(0 == the stage returned it immediately)")
+        for key, label in (("eval_groundedness", "groundedness"),
+                           ("eval_summarization", "summarization")):
+            ev = m.get(key)
+            if ev:
+                print(f"{pad}    EVAL {label}: score={ev.get('score')} "
+                      f"threshold={ev.get('threshold')} passed={ev.get('success')}")
+                if ev.get("reason"):
+                    print(f"{pad}      reason: {str(ev['reason'])[:200]}")
         if m.get("note"):
             print(f"{pad}    note : {m['note']}")
         for key in ("eval_groundedness", "eval_summarization"):

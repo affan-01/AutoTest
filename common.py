@@ -35,15 +35,38 @@ def artifacts_dir(story_id: str) -> Path:
     return d
 
 
-def snapshot_dir(path: Path) -> set:
+def snapshot_dir(path: Path) -> dict:
+    """Map every file under `path` to its mtime.
+
+    Returns mtimes rather than a bare set of paths because agents REWRITE their deliverables in
+    place. A set difference only sees files that did not exist before, so a stage whose agent
+    overwrote yesterday's report produced "no new artifacts" and was scored a failure.
+
+    That is not hypothetical: on 2026-08-29 an impact run analysed all three PRs and wrote all
+    three reports, but PR_434192's report already existed from the previous run. Overwriting it
+    created no new path, the stage counted 2 of 3, the hard gate stopped the pipeline before
+    generate and execute, and the $24 run was discarded over a bookkeeping artefact. The same
+    flaw let stage_groom pass only by accident, because the agent happened to create a
+    _history/ file alongside the report it overwrote.
+    """
     if not path.exists():
-        return set()
-    return {str(p) for p in path.rglob("*") if p.is_file()}
+        return {}
+    out = {}
+    for f in path.rglob("*"):
+        if f.is_file():
+            try:
+                out[str(f)] = f.stat().st_mtime
+            except OSError:
+                # Vanished between rglob and stat (agents write and clean up concurrently).
+                continue
+    return out
 
 
-def new_files_since(path: Path, before: set) -> list:
+def new_files_since(path: Path, before: dict) -> list:
+    """Files that are new OR were modified since `before` was taken."""
     after = snapshot_dir(path)
-    return [Path(p) for p in sorted(after - before)]
+    changed = [p for p, mt in after.items() if before.get(p) != mt]
+    return [Path(p) for p in sorted(changed)]
 
 
 @dataclass

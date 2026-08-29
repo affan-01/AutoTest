@@ -7,12 +7,14 @@ pointed at paths no agent writes to). See pipelines/README.md. This script does 
 anywhere: no TFS writes, no PR comments, no test-result uploads, no --publish flag.
 
 Usage:
-    python3 -m pipelines.flow --story-id <id> [--pr-id <id>]
+    python3 -m pipelines.flow --story-id <id> [--pr-id <id>[,<id>...]]
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -47,9 +49,81 @@ PR_ANALYSIS_REPORTS = REPO_ROOT / "bunker" / "pr-analysis-reports"
 BUNKER_TESTCASES = REPO_ROOT / "bunker" / "test-case-reports"
 BUNKER_EXECUTION = REPO_ROOT / "bunker" / "manual-test-execution"
 
+# Appended to every delegating prompt. Measured 2026-08-29: the delegating session answered
+# "I've kicked off the <agent>. It's running in the background - I'll let you know as soon as
+# it completes" and RETURNED IMMEDIATELY. run_agent saw stop_reason=end_turn after 2-3 turns,
+# the transcript was a status announcement rather than a result, and new_files_since() checked
+# a directory nothing had written to yet. Both groom and execute failed this way on the same
+# run while generate - which happened to run inline - passed. The stage is only complete when
+# the agent's own deliverable exists on disk.
+SYNC_DIRECTIVE = (
+    " Run this synchronously and do NOT dispatch it as a background task. Do not reply until "
+    "the agent has fully finished and its output files exist on disk. Your final message must "
+    "report the agent's actual findings and the absolute paths it wrote - not an announcement "
+    "that work has been started."
+)
+
 # Tool allowlists per stage, grounded in each agent's real `tools:` frontmatter.
 GROOM_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit"]
-IMPACT_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit"]
+IMPACT_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit",
+                 "mcp__rp-azure-devops__*", "mcp__azure-devops-files__*"]
+
+# core-pr-impact-analyzer's frontmatter states that ALL diffs come from GitHub via the `gh` CLI,
+# because "the dev repos migrated off TFS". That holds for PRs raised AFTER the migration and is
+# wrong for older ones, whose ids do not resolve on GitHub at all. Left alone the agent spends
+# real money hunting GitHub, finds nothing, and drops collector scripts for a human to run.
+#
+# Its MCP routes are dead ends for diffs too: the Azure DevOps MCP exposes no
+# diff/changes/iterations endpoint, and PAT-backed connectors fail once the token expires.
+# Windows Integrated Auth against the TFS REST API does work - verified against three
+# pre-migration PRs, returning 71, 77 and 16 changed files - so for those PRs we hand the agent
+# the working recipe rather than letting it rediscover a dead end.
+#
+# Host, project and repo are deliberately NOT hardcoded: they are site-specific, and baking one
+# organisation's TFS instance into the source makes the pipeline unportable. Configure via env,
+# e.g. in a local .env (which is gitignored):
+#   TFS_API_BASE=https://<tfs-host>/tfs/<collection>/<project>/_apis
+#   TFS_DIFF_REPO_NAME=<repo>
+#   TFS_DIFF_REPO_ID=<repo guid>
+# With TFS_API_BASE unset the override is empty and the agent follows its own GitHub-first
+# instructions unchanged - which is the correct behaviour for post-migration PRs.
+TFS_API_BASE = os.environ.get("TFS_API_BASE", "").rstrip("/")
+TFS_DIFF_REPO_NAME = os.environ.get("TFS_DIFF_REPO_NAME", "")
+TFS_DIFF_REPO_ID = os.environ.get("TFS_DIFF_REPO_ID", "")
+
+
+def tfs_diff_override() -> str:
+    """Instructions for pulling a pre-migration PR diff straight from the TFS REST API.
+
+    Returns "" when TFS_API_BASE is unset, so an unconfigured checkout behaves as though this
+    override did not exist rather than emitting a half-formed recipe with placeholder hosts.
+    """
+    if not TFS_API_BASE:
+        return ""
+    repo_hint = ""
+    if TFS_DIFF_REPO_NAME or TFS_DIFF_REPO_ID:
+        repo_id = f" (id {TFS_DIFF_REPO_ID})" if TFS_DIFF_REPO_ID else ""
+        repo_hint = f" Repo {TFS_DIFF_REPO_NAME or '<repo>'}{repo_id}."
+    return (
+        " IMPORTANT OVERRIDE - read before planning. This PR may PREDATE the GitHub migration."
+        " If its id does not resolve on GitHub then it exists only in TFS: stop spending turns"
+        " on `gh` or on resolving AB# references. Do NOT write a data-collection script for a"
+        " human to run - you have a working shell, so make the calls yourself."
+        " Fetch the diff from the TFS REST API using Windows Integrated Auth"
+        " (PowerShell Invoke-RestMethod -UseDefaultCredentials); do not use a stored PAT, which"
+        " may be expired." + repo_hint +
+        f" $b='{TFS_API_BASE}';"
+        " PR metadata:   $b/git/pullrequests/<PR>?api-version=3.0 ;"
+        " iterations:    $b/git/repositories/<repoId>/pullRequests/<PR>/iterations?api-version=3.0 ;"
+        " changed files: $b/git/repositories/<repoId>/pullRequests/<PR>/iterations/<lastId>/changes"
+        "?api-version=3.0 ;"
+        " file content:  $b/git/repositories/<repoId>/items?path=<path>"
+        "&versionDescriptor.version=<commitId>&versionDescriptor.versionType=commit&api-version=3.0 ."
+        " Run each call inline rather than from a saved .ps1 - script-file invocation against"
+        " this server is unreliable. Base the analysis on the REAL changed files you retrieve."
+    )
+
+
 # core-test-case-generator.md declares "All tools" — grant the concrete set it actually
 # needs (TFS MCP for the story/AC + Playwright MCP if it inspects the live app for grounding).
 GENERATE_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit",
@@ -104,29 +178,69 @@ def _new_files_all(before: dict) -> list:
     return out
 
 
+def _await_artifacts(before: dict, timeout_s: int = 420, poll_s: int = 5) -> tuple:
+    """Poll for the stage's deliverable before declaring it missing.
+
+    Belt to SYNC_DIRECTIVE's braces. The directive asks the delegating session not to return
+    early; this makes the check robust when it does anyway, since instruction-following is not
+    a guarantee. Returns as soon as anything appears, so a well-behaved stage pays nothing.
+
+    Deliberately bounded: a stage that genuinely produced nothing must still be reported
+    ok=False rather than hanging. `artifact_wait_ms` goes into the span so a run that only
+    passed because of this wait is visibly distinguishable from one that never needed it.
+    """
+    t0 = time.monotonic()
+    found = _new_files_all(before)
+    while not found and (time.monotonic() - t0) < timeout_s:
+        time.sleep(poll_s)
+        found = _new_files_all(before)
+    return found, int((time.monotonic() - t0) * 1000)
+
+
 @observe(type="agent", available_tools=GROOM_TOOLS)
 def stage_groom(story_id: str, story_dir: Path) -> StageResult:
     before = _snapshot_all(GROOM_DIRS)
     transcript = run_agent_sync(
         f'Use the Task tool with subagent_type="help-user-story-groomer" to groom the following '
-        f'user story: {story_id}',
+        f'user story: {story_id}' + SYNC_DIRECTIVE,
         allowed_tools=GROOM_TOOLS,
     )
     write_stage_log(story_dir, "01-groom", transcript)
-    artifacts = _new_files_all(before)
-    return _record_stage(StageResult("groom", ok=bool(artifacts), transcript=transcript, new_artifacts=artifacts))
+    artifacts, wait_ms = _await_artifacts(before)
+    return _record_stage(StageResult("groom", ok=bool(artifacts), transcript=transcript,
+                                     new_artifacts=artifacts), {"artifact_wait_ms": wait_ms})
 
 
 @observe(type="agent", available_tools=IMPACT_TOOLS)
-def stage_impact(pr_id: str, story_dir: Path) -> StageResult:
-    before = snapshot_dir(PR_ANALYSIS_REPORTS)
-    transcript = run_agent_sync(
-        f'Use the Task tool with subagent_type="core-pr-impact-analyzer" to analyze the following '
-        f'pull request: {pr_id}',
-        allowed_tools=IMPACT_TOOLS,
-    )
+def stage_impact(pr_ids, story_dir: Path) -> StageResult:
+    """Analyse EVERY PR behind the story, not just one.
+
+    A Spend feature is delivered across several dev sub-stories, each with its own PR, and the
+    PRs hang off THOSE stories rather than off the QA story itself - so nothing can resolve them
+    from the QA work item alone; the ids have to be supplied. US 2928495 is typical: nine closed
+    dev stories resolving to three distinct PRs (430902, 433487, 434192).
+
+    Analysing one and reporting on "the feature" would understate the blast radius, so each PR
+    gets its own agent call and its own llm span. The stage is ok only if EVERY PR produced a
+    report - a partial analysis is not a pass, because the missing PR is exactly the one whose
+    regressions would go unnoticed.
+    """
+    if isinstance(pr_ids, str):
+        pr_ids = [x.strip() for x in pr_ids.split(",") if x.strip()]
+
+    before = _snapshot_all([PR_ANALYSIS_REPORTS])
+    transcripts, reported = [], []
+    for pr in pr_ids:
+        t = run_agent_sync(
+            f'Use the Task tool with subagent_type="core-pr-impact-analyzer" to analyze the '
+            f'following pull request: {pr}' + tfs_diff_override() + SYNC_DIRECTIVE,
+            allowed_tools=IMPACT_TOOLS,
+        )
+        transcripts.append(f"===== PR {pr} =====\n{t}")
+        reported.append(pr)
+    transcript = "\n\n".join(transcripts)
     write_stage_log(story_dir, "02-impact", transcript)
-    artifacts = new_files_since(PR_ANALYSIS_REPORTS, before)
+    artifacts, wait_ms = _await_artifacts(before)
 
     # analyze-pr.md documents a sandboxed-shell fallback: the agent writes a .py/.mjs/.ps1
     # data-collection script and asks a HUMAN to run it, then re-invoke with "data collected
@@ -139,24 +253,35 @@ def stage_impact(pr_id: str, story_dir: Path) -> StageResult:
                  "instead of producing a report. This stage cannot complete headlessly as-is.",
         ))
 
-    impact_report = next((p for p in artifacts if p.suffix == ".md"), None)
-    if impact_report:
-        (story_dir / "impact-report.md").write_text(
-            impact_report.read_text(encoding="utf-8"), encoding="utf-8")
-    return _record_stage(StageResult("impact", ok=bool(impact_report), transcript=transcript, new_artifacts=artifacts))
+    md_reports = [p for p in artifacts if p.suffix == ".md"]
+    for md in md_reports:
+        (story_dir / f"impact-{md.stem}.md").write_text(
+            md.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # One report per PR is the bar. Fewer means a PR was silently skipped.
+    complete = len(md_reports) >= len(pr_ids)
+    note = None
+    if md_reports and not complete:
+        note = (f"only {len(md_reports)} report(s) for {len(pr_ids)} PRs "
+                f"({', '.join(pr_ids)}) - at least one PR was not analysed")
+    return _record_stage(
+        StageResult("impact", ok=bool(md_reports) and complete, transcript=transcript,
+                    new_artifacts=artifacts, note=note),
+        {"artifact_wait_ms": wait_ms, "pr_ids": pr_ids,
+         "pr_count": len(pr_ids), "md_report_count": len(md_reports)})
 
 
 @observe(type="agent", available_tools=GENERATE_TOOLS)
 def stage_generate(story_id: str, story_dir: Path, acceptance_criteria: str = ""):
-    before = snapshot_dir(BUNKER_TESTCASES)
+    before = _snapshot_all([BUNKER_TESTCASES])
     transcript = run_agent_sync(
         f'Use the Task tool with subagent_type="core-test-case-generator" to generate test '
-        f'cases for the following user story: {story_id}',
+        f'cases for the following user story: {story_id}' + SYNC_DIRECTIVE,
         allowed_tools=GENERATE_TOOLS,
         max_turns=80,
     )
     write_stage_log(story_dir, "03-generate", transcript)
-    artifacts = new_files_since(BUNKER_TESTCASES, before)
+    artifacts, wait_ms = _await_artifacts(before)
     testsuite_json = next((p for p in artifacts if p.name.endswith("-tests.testsuite.json")), None)
 
     if artifacts:
@@ -183,12 +308,13 @@ def stage_generate(story_id: str, story_dir: Path, acceptance_criteria: str = ""
             print(f"[flow] eval(generate groundedness): score={score} "
                   f"threshold={outcome.threshold} success={outcome.success} — {outcome.reason[:200]}")
 
-    return _record_stage(result, eval_metadata or None), testsuite_json
+    eval_metadata["artifact_wait_ms"] = wait_ms
+    return _record_stage(result, eval_metadata), testsuite_json
 
 
 @observe(type="agent", available_tools=EXECUTE_TOOLS)
 def stage_execute(story_id: str, story_dir: Path) -> StageResult:
-    before = snapshot_dir(BUNKER_EXECUTION)
+    before = _snapshot_all([BUNKER_EXECUTION])
     # Work-Item Mode: pass the bare story id so the agent runs ITS OWN TC-discovery chain
     # (TFS-linked -> local bunker, i.e. exactly what stage_generate just populated) and its own
     # env auto-detection. The draft this replaced routed through the /execute-tests skill,
@@ -196,7 +322,7 @@ def stage_execute(story_id: str, story_dir: Path) -> StageResult:
     # directly with a story id is the better-grounded fit for this pipeline.
     transcript = run_agent_sync(
         f'Use the Task tool with subagent_type="core-manual-testcase-executor" to execute user '
-        f'story {story_id}',
+        f'story {story_id}' + SYNC_DIRECTIVE,
         allowed_tools=EXECUTE_TOOLS,
         # This stage drives a live browser through many steps with mandatory
         # wait+snapshot+screenshot per action — a low generic max_turns will cut it off
@@ -205,7 +331,7 @@ def stage_execute(story_id: str, story_dir: Path) -> StageResult:
         max_turns=200,
     )
     write_stage_log(story_dir, "04-execute", transcript)
-    artifacts = new_files_since(BUNKER_EXECUTION, before)
+    artifacts, wait_ms = _await_artifacts(before)
 
     run_dir = story_dir / "run"
     run_dir.mkdir(exist_ok=True)
@@ -226,7 +352,8 @@ def stage_execute(story_id: str, story_dir: Path) -> StageResult:
         (run_dir / exec_log.name).write_text(
             exec_log.read_text(encoding="utf-8"), encoding="utf-8")
 
-    return _record_stage(StageResult("execute", ok=bool(report_md), transcript=transcript, new_artifacts=artifacts))
+    return _record_stage(StageResult("execute", ok=bool(report_md), transcript=transcript,
+                                     new_artifacts=artifacts), {"artifact_wait_ms": wait_ms})
 
 
 @observe(name="stage_report")
@@ -301,7 +428,9 @@ def main() -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--story-id", required=True)
-    parser.add_argument("--pr-id", default=None)
+    parser.add_argument("--pr-id", default=None,
+                        help="One PR id, or a comma-separated list. Every PR is analysed "
+                             "separately and ALL must produce a report for the stage to pass.")
     args = parser.parse_args()
 
     story_dir = artifacts_dir(args.story_id)
