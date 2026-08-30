@@ -7,9 +7,9 @@ command consumes test_run_*.json produced by evaluate()/pytest, whereas these tr
 no Confident AI key is set).
 
 Usage:
-    python -m pipelines.trace_report <story-id>          # artifacts/flow/<id>/trace.jsonl
+    python -m pipelines.trace_report <ticket-id>          # artifacts/flow/<id>/trace.jsonl
     python -m pipelines.trace_report path/to/trace.jsonl
-    python -m pipelines.trace_report <story-id> --all    # every run, not just the latest
+    python -m pipelines.trace_report <ticket-id> --all    # every run, not just the latest
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def render(trace: dict) -> None:
     md = trace.get("metadata") or {}
     print("=" * 78)
     print(f"TRACE  {trace.get('name') or '(unnamed)'}   status={trace.get('status')}")
-    print(f"  story        : {md.get('story_id') or trace.get('thread_id')}")
+    print(f"  ticket       : {md.get('ticket_id') or trace.get('thread_id')}")
     print(f"  tags         : {', '.join(trace.get('tags') or []) or '-'}")
     if md.get("stages_run") is not None:
         print(f"  stages run   : {', '.join(md.get('stages_run') or []) or '-'}")

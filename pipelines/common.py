@@ -2,12 +2,15 @@
 
 Every stage delegates to a real agent defined under .claude/agents/. This module wraps the
 Claude Agent SDK to run one stage headlessly, and provides directory-diffing helpers to discover
-each stage's actual output artifacts (grooming-reports/, pr-analysis-reports/, bunker/*, ...)
-instead of guessing filenames the agents never documented.
+each stage's actual output artifacts instead of guessing filenames the agents never documented.
+
+This pipeline ships a TFS/Azure DevOps reference adapter (see docs/adapters/tfs.md) but the
+helpers here don't assume any particular PM tool.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,22 +18,37 @@ from typing import Optional
 
 from pipelines.tracing import observe, update_current_span, update_llm_span
 
+# This file lives at <repo root>/pipelines/common.py, so one level up is the `pipelines/`
+# package dir and two levels up is the actual repo root — where pipeline.config.json,
+# pipeline.config.example.json, docs/, and README.md all live, and where artifacts/bunker
+# output directories are created.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS_ROOT = REPO_ROOT / "artifacts" / "flow"
 
-# Real TFS auth env-var names referenced by this repo's own agents (see
-# .claude/agent-memory/core-pr-impact-analyzer/auth-and-api-versions.md) — NOT "TFS_PAT".
-# As of the last check, the stored PAT there is dead (401 on everything) and TFS calls
-# fall back to Windows Integrated Auth on this machine (see that agent's
-# powershell-gotchas.md memory). A headless run under a different account/service
-# (e.g. a future ADO pipeline agent) will NOT get that fallback for free — do not
-# assume ADO_PAT alone is sufficient there without checking.
+
+def load_pipeline_config() -> dict:
+    """Load pipeline.config.json from the repo root, if present.
+
+    Returns {} when absent so callers can safely use dict.get(...) with a fallback default —
+    this file is optional and gitignored. Run `python3 -m pipelines.configure` (a local web form)
+    or copy pipeline.config.example.json by hand to get started; see docs/CONFIGURATION.md.
+    """
+    path = REPO_ROOT / "pipeline.config.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+# Env-var names the TFS/Azure DevOps reference adapter's agents read for auth (see
+# docs/adapters/tfs.md). A stored PAT can go dead (401 on everything) and TFS calls fall back to
+# Windows Integrated Auth instead — that fallback is per-machine/per-account, so a headless run
+# under a different account (e.g. a CI service) will not get it for free. Verify auth actually
+# works there rather than assuming ADO_PAT alone is sufficient.
 ADO_PAT_ENV = "ADO_PAT"
 TFS_ORG_URL_ENV = "TFS_ORG_URL"
 
 
-def artifacts_dir(story_id: str) -> Path:
-    d = ARTIFACTS_ROOT / str(story_id)
+def artifacts_dir(ticket_id: str) -> Path:
+    d = ARTIFACTS_ROOT / str(ticket_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -40,14 +58,14 @@ def snapshot_dir(path: Path) -> dict:
 
     Returns mtimes rather than a bare set of paths because agents REWRITE their deliverables in
     place. A set difference only sees files that did not exist before, so a stage whose agent
-    overwrote yesterday's report produced "no new artifacts" and was scored a failure.
+    overwrote a previous report produced "no new artifacts" and was scored a failure.
 
-    That is not hypothetical: on 2026-08-29 an impact run analysed all three PRs and wrote all
-    three reports, but PR_434192's report already existed from the previous run. Overwriting it
-    created no new path, the stage counted 2 of 3, the hard gate stopped the pipeline before
-    generate and execute, and the $24 run was discarded over a bookkeeping artefact. The same
-    flaw let stage_groom pass only by accident, because the agent happened to create a
-    _history/ file alongside the report it overwrote.
+    That is not hypothetical: on one real run an impact stage analysed all three linked PRs and
+    wrote all three reports, but one report already existed from a previous run. Overwriting it
+    created no new path, the stage counted 2 of 3, and the hard gate stopped the pipeline before
+    generate and execute over a bookkeeping artefact, not a real failure. The same flaw let
+    stage_groom pass only by accident, because the agent happened to create a side-file alongside
+    the report it overwrote.
     """
     if not path.exists():
         return {}
@@ -89,26 +107,24 @@ async def run_agent(prompt: str, *, allowed_tools: list, max_turns: int = 40,
     path constants) before `pip install claude-agent-sdk` has actually been run.
 
     NOTE: setting_sources=["project"] only loads .claude/settings.json + .mcp.json from THIS
-    repo. RESOLVED 2026-08-27: there is no .mcp.json at this repo root at all. The MCP servers
-    this pipeline needs — "playwright", "rp-azure-devops", "azure-devops-files" — are registered
-    at USER scope in ~/.claude.json, and no project defines any. setting_sources=["project"]
-    therefore resolved every mcp__* entry to nothing, starving the generate/execute stages of
-    both Playwright and TFS. Hence the ["user", "project"] default below.
+    repo. If your project has no .mcp.json at its root, MCP servers registered at USER scope
+    (in your global Claude settings) won't resolve under setting_sources=["project"] alone —
+    every mcp__* tool name would resolve to nothing, starving stages that need them (e.g. a
+    browser-automation MCP for execute, or your PM tool's MCP for impact/generate). Hence the
+    ["user", "project"] default below.
 
     Note this pulls in the user's global settings (permissions included), which is the point —
-    but it does mean a headless run under a different account (e.g. a future ADO pipeline agent)
-    inherits nothing and will silently starve again. Verify MCP availability there rather than
-    assuming. Also note "mcp__rpdevops__*" in flow.py's allowlists matches NO registered server
-    (the real one is "rp-azure-devops"); it is dead but harmless.
+    but it does mean a headless run under a different account (e.g. a CI agent) inherits nothing
+    and will silently starve again. Verify MCP availability there rather than assuming.
 
-    MCP TOOLS ARRIVE LATE AND DEFERRED (verified 2026-08-27). At init every server reports
-    status "pending" and the agent's immediate tool list contains NO mcp__* entries at all —
-    asked to list them on turn 1, it truthfully answers "none". They attach a few seconds
-    later, and even then they are DEFERRED: the sub-agent must call ToolSearch to load their
-    schemas before it can invoke one. Two consequences for the stage budgets above: a stage
-    that finishes in one or two turns may never see Playwright or TFS at all, and the turns
-    spent on ToolSearch come out of max_turns. Do not read an early "no MCP tools" as proof
-    of misconfiguration — it is the expected shape of a very short session.
+    MCP TOOLS CAN ARRIVE LATE AND DEFERRED. At init an MCP server can report status "pending"
+    and the agent's immediate tool list may contain NO mcp__* entries at all — asked to list
+    them on turn 1, it truthfully answers "none". They can attach a few seconds later, and even
+    then may be DEFERRED: the sub-agent must call a tool-search step to load their schemas
+    before it can invoke one. Two consequences for the stage budgets above: a stage that
+    finishes in one or two turns may never see those MCP tools at all, and the turns spent
+    discovering them come out of max_turns. Do not read an early "no MCP tools" as proof of
+    misconfiguration — it can be the expected shape of a very short session.
     """
     from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ResultMessage  # type: ignore
 
@@ -160,13 +176,13 @@ def _record_session(prompt: str, transcript: str, tool_names: list,
 
     run_agent previously read only `is_error` and discarded the rest. The discarded fields are
     the ones that actually explain a failed run: `stop_reason == "max_turns"` (the README's top
-    known risk), `permission_denials` (proves MCP starvation), and `api_error_status` (a 401
+    known risk), `permission_denials` (proves tool starvation), and `api_error_status` (a 401
     from a stale ANTHROPIC_API_KEY is otherwise indistinguishable from a hang).
 
     COST/TURN/DURATION UNDER-REPORT WHEN A STAGE DELEGATES. Measured on two real groom runs of
-    US 2928495 (2026-08-28). When the session did the work inline every field agreed; when it
-    delegated to a sub-agent via the Agent tool, ResultMessage described only the PARENT's own
-    turns and the aggregates collapsed:
+    the same ticket: when the session did the work inline every field agreed; when it delegated
+    to a sub-agent via the Agent tool, ResultMessage described only the PARENT's own turns and
+    the aggregates collapsed:
 
         num_turns      = 2         while 35 tool calls were recorded
         duration_ms    = 8,955     while the wall clock was 629,000  (70x)
@@ -238,7 +254,7 @@ def run_agent_sync(prompt: str, **kwargs) -> str:
     return asyncio.run(run_agent(prompt, **kwargs))
 
 
-def write_stage_log(story_dir: Path, stage: str, transcript: str) -> Path:
-    out = story_dir / f"{stage}.transcript.txt"
+def write_stage_log(ticket_dir: Path, stage: str, transcript: str) -> Path:
+    out = ticket_dir / f"{stage}.transcript.txt"
     out.write_text(transcript, encoding="utf-8")
     return out

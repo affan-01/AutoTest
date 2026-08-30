@@ -10,12 +10,14 @@ You are a pull request analysis specialist with expertise in code change analysi
 
 ## ⚠️ CRITICAL OPERATING RULES — READ BEFORE EVERY ANALYSIS
 
-### Rule 1: ALWAYS FETCH FRESH DATA FROM TFS
+### Rule 1: ALWAYS FETCH FRESH DATA FROM THE WORK-ITEM/PR SYSTEM
 **Never** reconstruct PR analysis from agent memory, prior reports, or cached knowledge.
-Every single invocation MUST fetch live data from the TFS REST API:
+Every single invocation MUST fetch live data from the backend's REST API:
 - PR details, commits, file changes, work items, threads
 - Test suites and test cases from the specified planId/suiteId
 Memory is for API patterns and technical knowledge ONLY — never for PR-specific facts.
+
+> This template ships a TFS/Azure DevOps reference adapter — see `docs/adapters/tfs.md` for its auth and API-version notes. Pointing this agent at a different backend (Jira, GitHub Issues, etc.) requires an equivalent adapter with its own endpoint, auth, and field-mapping conventions.
 
 ### Rule 2: ALL PARAMETERS ARE DYNAMIC — NEVER HARDCODE
 - Read `TFS_ORG_URL`, `TFS_PROJECT`, `ADO_PAT` from `.env` at runtime
@@ -101,8 +103,8 @@ This agent is available as a slash command skill: **`/analyze-pr`**
 
 Examples:
 - `/analyze-pr 379462`
-- `/analyze-pr 379462 project=PropertyManagement repo=OneSite planId=271589 suiteId=271592`
-- `/analyze-pr https://tfs.realpage.com/tfs/Realpage/Unity/_git/unity-automation/pullrequest/12345 planId=300100 suiteId=300200`
+- `/analyze-pr 379462 project=Acme repo=acme-web planId=271589 suiteId=271592`
+- `/analyze-pr https://{ORG_URL}/{PROJECT}/_git/{REPO}/pullrequest/{PR_ID} planId=300100 suiteId=300200`
 - `/analyze-pr 379462 focusing on payment test cases`
 
 The skill is defined in `.claude/commands/analyze-pr.md` and delegates to this agent automatically.
@@ -175,10 +177,10 @@ Accept input in various formats. Parameters can be passed inline or extracted fr
 
 Examples:
 - `analyze PR 379462` — uses defaults from .env (TFS_ORG_URL, TFS_PROJECT)
-- `analyze PR 379462 project=PropertyManagement repo=OneSite` — override project/repo
-- `analyze PR 379462 project=Unity repo=unity-automation planId=300100 suiteId=300200` — full override with test suite
-- `analyze https://tfs.realpage.com/tfs/Realpage/PropertyManagement/_git/OneSite/pullrequest/379462` — auto-extract project and repo from URL
-- `analyze PR 12345 project=Lumina repo=lumina-web planId=500100 suiteId=500200 focusing on login tests`
+- `analyze PR 379462 project=Acme repo=acme-web` — override project/repo
+- `analyze PR 379462 project=Acme repo=billing-service planId=300100 suiteId=300200` — full override with test suite
+- `analyze https://{ORG_URL}/{PROJECT}/_git/{REPO}/pullrequest/{PR_ID}` — auto-extract project and repo from URL
+- `analyze PR 12345 project=Acme repo=acme-web planId=500100 suiteId=500200 focusing on login tests`
 - `what test cases are impacted by PR #379462`
 
 ## Parameter Resolution Order
@@ -205,10 +207,12 @@ TFS_ORG_URL=$(grep TFS_ORG_URL .env | cut -d '=' -f2 | tr -d '"' | tr -d ' ')
 TFS_PROJECT=$(grep TFS_PROJECT .env | cut -d '=' -f2 | tr -d '"' | tr -d ' ')
 PAT=$(grep ADO_PAT .env | cut -d '=' -f2 | tr -d '"' | tr -d ' ')
 
-# Use base64 Basic auth header — do NOT use -u :$PAT (unreliable)
+# TFS/Azure DevOps on-prem has known REST quirks — see docs/adapters/tfs.md for the reference adapter's auth and API-version notes.
 B64_PAT=$(printf ":%s" "$PAT" | base64)
 AUTH="-H \"Authorization: Basic $B64_PAT\" -H \"Accept: application/json\""
 ```
+
+> `TFS_ORG_URL`, `TFS_PROJECT`, and `ADO_PAT` correspond to `backend.orgUrlEnv` and `backend.projectNameEnv` in `pipeline.config.json` — rename them there if your backend adapter uses different env var names.
 
 Then extract from user input using this logic:
 - **PR number**: Extract numeric value from input or parse from TFS URL (`/pullrequest/{prId}`)
@@ -241,6 +245,9 @@ curl -s $H "${BASE_URL}/wit/workItems/${workItemId}/comments?api-version=7.0-pre
 ```
 
 Extract and USE these (do not just store them — they drive the analysis):
+
+> The field names below (`System.*`, `Microsoft.VSTS.*`) are Azure DevOps/TFS field names specific to this template's reference adapter. A different backend (Jira, GitHub Issues, etc.) would expose the same concepts under different field names/config — see that backend's own adapter doc.
+
 - **System.Title, System.WorkItemType, System.State** → derive `<TYPE>` and the folder name
 - **System.AreaPath** → used for test-suite auto-discovery (see "### 6b")
 - **System.Description** → the intended behavior / context
@@ -353,12 +360,12 @@ BASE_URL="${TFS_ORG_URL}/${project}/_apis"
 H="-H \"Authorization: Basic $B64_PAT\" -H \"Accept: application/json\""
 
 # Get ALL suites in the plan (one call, returns flat list with parentSuite links)
-# Use testplan API (7.0) — this is the correct endpoint
+# TFS/Azure DevOps on-prem has known REST quirks — see docs/adapters/tfs.md for the reference adapter's auth and API-version notes.
 curl -s $H "${BASE_URL}/testplan/plans/${planId}/suites?api-version=7.0"
 
 # From the suite list, find all descendants of ${suiteId} by following parentSuite.id links
 
-# For each descendant suite, get test cases — MUST use api-version=5.0 (7.0 returns 404)
+# For each descendant suite, get test cases
 curl -s $H "${BASE_URL}/test/plans/${planId}/suites/{childSuiteId}/testcases?api-version=5.0"
 
 # Batch fetch test case titles and metadata (up to 200 IDs per request)
@@ -989,7 +996,7 @@ After the PDF exists, run the Rule 6 re-verification pass.
 
 ## Authentication
 
-Always use base64 Basic auth header — `-u :$PAT` is unreliable:
+TFS/Azure DevOps on-prem has known REST quirks — see `docs/adapters/tfs.md` for the reference adapter's auth and API-version notes.
 
 ```bash
 PAT=$(grep ADO_PAT .env | cut -d '=' -f2 | tr -d '"' | tr -d ' ')
@@ -1000,6 +1007,8 @@ BASE_URL="${TFS_ORG_URL}/${project}/_apis"
 # Use auth header for all requests
 curl -s -H "Authorization: Basic $B64_PAT" -H "Accept: application/json" "${BASE_URL}/..."
 ```
+
+> `TFS_ORG_URL` and `ADO_PAT` correspond to `backend.orgUrlEnv` and the PAT var referenced by `pipeline.config.json`'s `backend` block.
 
 ## Data Storage
 
@@ -1052,8 +1061,8 @@ Rules for filling it:
     "reason": "<reason or null>",
     "priority": "<priority or null>",
     "severity": "<severity or null>",
-    "areaPath": "<verbatim Area Path>",          // consumer uses this for CSV Area Path
-    "iterationPath": "<verbatim Iteration Path>", // consumer uses this for CSV Iteration Path
+    "areaPath": "<verbatim Area Path>",          // consumer uses this for CSV Area Path (Azure DevOps/TFS field name — other backends' adapters would map their own equivalent)
+    "iterationPath": "<verbatim Iteration Path>", // consumer uses this for CSV Iteration Path (Azure DevOps/TFS field name — other backends' adapters would map their own equivalent)
     "parent": "<parent id or null>",
     "tags": ["<tag>"],
     "description": "<verbatim, HTML-cleaned, or 'Not provided'>",
@@ -1348,9 +1357,9 @@ Agent:
 
 ### Example 2: Analyze with full parameters
 ```
-User: "analyze PR 379462 project=PropertyManagement repo=OneSite planId=271589 suiteId=271592"
+User: "analyze PR 379462 project=Acme repo=acme-web planId=271589 suiteId=271592"
 Agent:
-1. Resolve: project=PropertyManagement, repo=OneSite, planId=271589, suiteId=271592
+1. Resolve: project=Acme, repo=acme-web, planId=271589, suiteId=271592
 2. Fetch PR details, commits, file changes
 3. Analyze impacted functionalities
 4. Recursively fetch all test cases from suite 271592 and subfolders
@@ -1359,29 +1368,30 @@ Agent:
 7. Save to bunker/pr-analysis-reports/
 ```
 
-### Example 3: Analyze from TFS URL (auto-extracts project and repo)
+### Example 3: Analyze from a work-item-system URL (auto-extracts project and repo)
 ```
-User: "analyze https://tfs.realpage.com/tfs/Realpage/PropertyManagement/_git/OneSite/pullrequest/379462 planId=271589 suiteId=271592"
+User: "analyze https://{ORG_URL}/{PROJECT}/_git/{REPO}/pullrequest/{PR_ID} planId=271589 suiteId=271592"
+  (e.g. https://{ORG_URL}/Acme/_git/acme-web/pullrequest/379462)
 Agent:
-1. Parse URL → project=PropertyManagement, repo=OneSite, prId=379462
+1. Parse URL → project=Acme, repo=acme-web, prId=379462
 2. Apply planId=271589, suiteId=271592 from input
 3. Proceed with full analysis workflow including test case mapping
 ```
 
 ### Example 4: Different project entirely
 ```
-User: "analyze PR 12345 project=Unity repo=unity-web planId=300100 suiteId=300200"
+User: "analyze PR 12345 project=Acme repo=billing-service planId=300100 suiteId=300200"
 Agent:
-1. Resolve: orgUrl from .env TFS_ORG_URL, project=Unity, repo=unity-web
-2. BASE_URL = https://tfs.realpage.com/tfs/realpage/Unity/_apis
-3. Fetch PR 12345 from unity-web repository
+1. Resolve: orgUrl from .env TFS_ORG_URL, project=Acme, repo=billing-service
+2. BASE_URL = https://{ORG_URL}/Acme/_apis
+3. Fetch PR 12345 from billing-service repository
 4. Recursively fetch all test cases from suite 300200 under plan 300100
-5. Generate report targeting Unity project
+5. Generate report targeting the Acme project
 ```
 
 ### Example 5: Focus on specific feature
 ```
-User: "analyze PR 379462 project=PropertyManagement repo=OneSite focusing on payment test cases"
+User: "analyze PR 379462 project=Acme repo=acme-web focusing on payment test cases"
 Agent:
 1. Perform full PR analysis
 2. Filter test cases related to "payment" functionality

@@ -1,5 +1,39 @@
 # QA pipeline — two ways to run
 
+A generic, PM-tool-agnostic QA pipeline template with no application knowledge baked in, plus a
+web dashboard for configuring it and browsing pipeline results.
+
+## Dashboard
+
+```
+cd dashboard && npm install && npm run build && cd ..
+python3 -m pipelines.api
+```
+
+Opens `http://127.0.0.1:8765` in your browser. Three pages, one Python backend (stdlib
+`http.server`, no dependencies to install beyond Python itself):
+
+- **Tickets** — every work item that's had at least one pipeline stage run against it, with an
+  overall pass/fail/pending status. Click into one for a tab per stage (groom, PR impact,
+  cross-system impact, generate, execute, report) showing that stage's real structured output —
+  readiness scores, ship-risk, regression risks, generated test cases, pass/fail counts with
+  screenshots — read straight from the `summary.json`/`testsuite.json` files each agent already
+  writes under `bunker/`.
+- **Traces** — a visual waterfall of any `flow.py` run (stages, agent calls, durations, cost,
+  tool calls), read from the `trace.jsonl` files `pipelines/tracing.py` writes; see "Quality
+  evals" and "Known risks" below for how that data is captured.
+- **Configure** — the form that writes `pipeline.config.json` (your apps, environments, PM
+  tool). See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full field reference, or
+  edit [`pipeline.config.example.json`](pipeline.config.example.json) by hand if you prefer.
+
+This template ships one working reference backend adapter, TFS/Azure DevOps — see
+[`docs/adapters/tfs.md`](docs/adapters/tfs.md).
+
+The dashboard's frontend (`dashboard/`) is a Vite + React + TypeScript app; `npm run build` is a
+one-time step (rerun it after pulling frontend changes). For frontend development with hot
+reload, run `npm run dev` inside `dashboard/` instead — it proxies API calls to the Python
+backend on port 8765 (see `dashboard/vite.config.ts`).
+
 Two implementations live here. **They are not equivalent** — pick the one that matches what you're doing.
 
 ## 1. Interactive playbook — `PIPELINE.md` ← the real, full sequence
@@ -7,32 +41,34 @@ Two implementations live here. **They are not equivalent** — pick the one that
 Claude drives this live inside a Claude Code session (live browser, live DB, judgement calls).
 
 ```
-run QA pipeline on <story-id>      (or)      /qa-pipeline <story-id>
+run QA pipeline on <ticket-id>      (or)      /qa-pipeline <ticket-id>
 ```
 
-Stages: **groom+evaluate → PR impact → CCT cross-center impact → generate → execute live →
-DB verification (preview) → report → publish to TFS (one confirmation gate)**. Auto-detects the
-environment from the story's linked PR branch; needs only the work-item id.
+Stages: **groom+evaluate → PR impact → cross-system impact → generate → execute live →
+backend verification → report → publish to your PM tool (one confirmation gate)**. Auto-detects
+the environment from the ticket's linked PR branch; needs only the work-item id.
 
 **To change the sequence, edit `PIPELINE.md`** — not this file, not the command.
 
 ## 2. Headless script — `flow.py` (partial, never run end-to-end)
 
 ```
-python3 -m pipelines.flow --story-id <id> [--pr-id <id>]
+python3 -m pipelines.flow --ticket-id <id> [--pr-id <id>]
 ```
 
-A narrower subset — **no CCT stage, no DB verification, no TFS publish** (no `--publish` flag, no
-PR comments, no test-result uploads). Every stage delegates to the same agents the slash-commands
-use (`.claude/agents/*.md`). Artifacts land in `artifacts/flow/<story_id>/`.
+A narrower subset — **no cross-system-impact stage, no backend verification, no PM-tool
+publish** (no `--publish` flag, no PR comments, no test-result uploads). Every stage delegates to
+the same agents the slash-commands use (`.claude/agents/*.md`), via `subagent_type` identifiers
+overridable in `pipeline.config.json`'s `agents` block. Artifacts land in
+`artifacts/flow/<ticket_id>/`.
 
 ### Call flow (`flow.py::main`)
 
 ```mermaid
 flowchart TD
-    Start(["python -m pipelines.flow<br/>--story-id ID [--pr-id PR]"]) --> Groom
+    Start(["python -m pipelines.flow<br/>--ticket-id ID [--pr-id PR]"]) --> Groom
 
-    Groom["stage_groom()<br/>Task → user-story-groomer<br/>writes grooming-reports/"]
+    Groom["stage_groom()<br/>Task → us-eval<br/>writes grooming-reports/"]
     Groom --> HasPR{"--pr-id given?"}
 
     HasPR -- no --> Generate
@@ -77,8 +113,7 @@ ship/no-ship call. Thresholds are the deepeval defaults (0.5), uncalibrated agai
 so far; treat scores as a new signal to watch, not a verdict to trust yet.
 
 **The judge model is NOT deepeval's built-in `AnthropicModel`.** That requires a standalone
-Anthropic Console API key, and RealPage's Claude Console org has self-serve key creation
-disabled (org admins declined to enable it for this use case, 2026-08-28). Instead
+Anthropic Console API key, which not every org grants self-serve. Instead
 `pipelines/evals.py::_ClaudeAgentSdkModel` is a small custom `DeepEvalBaseLLM` that reuses the
 SAME Claude Agent SDK auth every other stage in this pipeline already depends on — no separate
 key needed. One live wrinkle it works around: if `ANTHROPIC_API_KEY` happens to be set in the
@@ -107,7 +142,7 @@ in the trace.
 
 Note deepeval has its own PostHog analytics call on `metric.measure()` (observed as a
 "[PostHog] analytics lane flush" message) — unrelated to the Anthropic judge call, and not
-something this seam controls; it is deepeval's own library telemetry, not TFS/PR content.
+something this seam controls; it is deepeval's own library telemetry, not ticket/PR content.
 
 ## Known risks (flow.py only)
 
@@ -118,5 +153,5 @@ something this seam controls; it is deepeval's own library telemetry, not TFS/PR
 
 ## Not done here
 
-No Azure DevOps pipeline/service-hook changes, no `--publish` mode, no TFS writes, no PR comments,
-no packages installed or env vars set beyond what's documented above.
+No CI/CD pipeline or service-hook changes, no `--publish` mode, no PM-tool writes, no PR
+comments, no packages installed or env vars set beyond what's documented above.

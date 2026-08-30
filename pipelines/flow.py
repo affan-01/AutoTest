@@ -1,13 +1,13 @@
 """Local, headless QA flow: groom -> impact (optional, needs --pr-id) -> generate -> execute -> report.
 
-Every stage delegates to the SAME agents this repo's slash-commands use. Agent names and
-output paths re-verified against .claude/agents/*.md on 2026-08-27 — the previous set was
-stale (all four subagent_type strings had been renamed, and two watched output directories
-pointed at paths no agent writes to). See pipelines/README.md. This script does not publish
-anywhere: no TFS writes, no PR comments, no test-result uploads, no --publish flag.
+Every stage delegates to a real agent defined under .claude/agents/*.md — the agent identifiers
+used below are defaults that match this template's shipped agents, but are overridable via the
+`agents` block in pipeline.config.json (see pipeline.config.example.json / docs/CONFIGURATION.md)
+in case you rename or replace one. This script does not publish anywhere: no PM-tool writes, no
+PR comments, no test-result uploads, no --publish flag.
 
 Usage:
-    python3 -m pipelines.flow --story-id <id> [--pr-id <id>[,<id>...]]
+    python3 -m pipelines.flow --ticket-id <id> [--pr-id <id>[,<id>...]]
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 from pipelines.common import (
     REPO_ROOT, artifacts_dir, snapshot_dir, new_files_since,
-    run_agent_sync, write_stage_log, StageResult,
+    run_agent_sync, write_stage_log, StageResult, load_pipeline_config,
 )
 from pipelines.evals import (
     evaluate_generate_groundedness, evaluate_report_summary, evals_banner,
@@ -31,17 +31,23 @@ from pipelines.tracing import (
     set_trace_output, tracing_banner,
 )
 
-# These previously pointed at repo-root folders no agent has ever written to, so
-# new_files_since() returned [] unconditionally and groom/impact were always ok=False.
+_CONFIG = load_pipeline_config()
+_AGENT_NAMES = _CONFIG.get("agents", {})
+_BACKEND = _CONFIG.get("backend", {})
+_MCP_TOOL_PREFIX = _BACKEND.get("mcpToolPrefix", "mcp__your-pm-tool__")
+
+AGENT_GROOM = _AGENT_NAMES.get("groom", "us-eval")
+AGENT_IMPACT = _AGENT_NAMES.get("impact", "pr-impact-analyzer")
+AGENT_GENERATE = _AGENT_NAMES.get("generate", "test-case-generation-agent")
+AGENT_EXECUTE = _AGENT_NAMES.get("execute", "manual-test-execution-agent")
+
+# Each stage watches the output directory(ies) its agent actually documents writing to — verify
+# this against your own agents' frontmatter/instructions if you swap one out. A stage watching a
+# directory nothing writes to will always report "no artifact found", not a helpful error.
 #
-# Groom watches TWO directories, and that is deliberate rather than defensive clutter. The
-# destination depends on which route actually services the request, verified on a real run
-# 2026-08-27: help-user-story-groomer's own file documents bunker/story-grooming-reports/,
-# but that agent FAILS TO REGISTER (its YAML frontmatter has an unquoted description
-# containing "excluded: <group>", so the colon breaks the parse). The delegating session
-# silently falls back to the grooming SKILL, which writes output/grooming-reports/ instead.
-# Watch both so this stage reports honestly whichever path is taken; drop the alt once the
-# frontmatter is fixed and the agent registers.
+# Groom watches TWO directories: some grooming setups route through a dedicated agent, others
+# fall back to a grooming skill/prompt that writes to a different path. Watch both so this stage
+# reports honestly whichever path was actually taken.
 GROOMING_REPORTS = REPO_ROOT / "bunker" / "story-grooming-reports"
 GROOMING_REPORTS_ALT = REPO_ROOT / "output" / "grooming-reports"
 GROOM_DIRS = [GROOMING_REPORTS, GROOMING_REPORTS_ALT]
@@ -49,13 +55,11 @@ PR_ANALYSIS_REPORTS = REPO_ROOT / "bunker" / "pr-analysis-reports"
 BUNKER_TESTCASES = REPO_ROOT / "bunker" / "test-case-reports"
 BUNKER_EXECUTION = REPO_ROOT / "bunker" / "manual-test-execution"
 
-# Appended to every delegating prompt. Measured 2026-08-29: the delegating session answered
-# "I've kicked off the <agent>. It's running in the background - I'll let you know as soon as
-# it completes" and RETURNED IMMEDIATELY. run_agent saw stop_reason=end_turn after 2-3 turns,
-# the transcript was a status announcement rather than a result, and new_files_since() checked
-# a directory nothing had written to yet. Both groom and execute failed this way on the same
-# run while generate - which happened to run inline - passed. The stage is only complete when
-# the agent's own deliverable exists on disk.
+# Appended to every delegating prompt. A delegating session can reply "I've kicked off the
+# <agent>, I'll let you know when it's done" and return immediately — the parent sees a normal
+# end-of-turn after a couple of turns, the transcript is a status announcement rather than a
+# result, and the watched directory has nothing new yet. The stage is only complete when the
+# agent's own deliverable exists on disk, so be explicit that background dispatch is not enough.
 SYNC_DIRECTIVE = (
     " Run this synchronously and do NOT dispatch it as a background task. Do not reply until "
     "the agent has fully finished and its output files exist on disk. Your final message must "
@@ -65,35 +69,30 @@ SYNC_DIRECTIVE = (
 
 # Tool allowlists per stage, grounded in each agent's real `tools:` frontmatter.
 GROOM_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit"]
-IMPACT_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit",
-                 "mcp__rp-azure-devops__*", "mcp__azure-devops-files__*"]
+IMPACT_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit", f"{_MCP_TOOL_PREFIX}*"]
 
-# core-pr-impact-analyzer's frontmatter states that ALL diffs come from GitHub via the `gh` CLI,
-# because "the dev repos migrated off TFS". That holds for PRs raised AFTER the migration and is
-# wrong for older ones, whose ids do not resolve on GitHub at all. Left alone the agent spends
-# real money hunting GitHub, finds nothing, and drops collector scripts for a human to run.
-#
-# Its MCP routes are dead ends for diffs too: the Azure DevOps MCP exposes no
-# diff/changes/iterations endpoint, and PAT-backed connectors fail once the token expires.
-# Windows Integrated Auth against the TFS REST API does work - verified against three
-# pre-migration PRs, returning 71, 77 and 16 changed files - so for those PRs we hand the agent
-# the working recipe rather than letting it rediscover a dead end.
+# The PR-impact agent's default instructions assume PR diffs are reachable via a `gh`-style CLI
+# or a REST API tied to your PM tool. Some on-prem setups (e.g. a pre-migration TFS instance)
+# need a different diff-fetching recipe than the agent's own default — this override exists for
+# that case. It is entirely opt-in and TFS-flavored because TFS is this template's one shipped
+# reference adapter (see docs/adapters/tfs.md); if your backend needs an equivalent override,
+# add one following this same pattern rather than editing the agent prompt itself.
 #
 # Host, project and repo are deliberately NOT hardcoded: they are site-specific, and baking one
-# organisation's TFS instance into the source makes the pipeline unportable. Configure via env,
+# organization's TFS instance into the source makes the pipeline unportable. Configure via env,
 # e.g. in a local .env (which is gitignored):
 #   TFS_API_BASE=https://<tfs-host>/tfs/<collection>/<project>/_apis
 #   TFS_DIFF_REPO_NAME=<repo>
 #   TFS_DIFF_REPO_ID=<repo guid>
-# With TFS_API_BASE unset the override is empty and the agent follows its own GitHub-first
-# instructions unchanged - which is the correct behaviour for post-migration PRs.
+# With TFS_API_BASE unset the override is empty and the agent follows its own default
+# instructions unchanged.
 TFS_API_BASE = os.environ.get("TFS_API_BASE", "").rstrip("/")
 TFS_DIFF_REPO_NAME = os.environ.get("TFS_DIFF_REPO_NAME", "")
 TFS_DIFF_REPO_ID = os.environ.get("TFS_DIFF_REPO_ID", "")
 
 
 def tfs_diff_override() -> str:
-    """Instructions for pulling a pre-migration PR diff straight from the TFS REST API.
+    """Instructions for pulling a PR diff straight from the TFS REST API (see docs/adapters/tfs.md).
 
     Returns "" when TFS_API_BASE is unset, so an unconfigured checkout behaves as though this
     override did not exist rather than emitting a half-formed recipe with placeholder hosts.
@@ -105,10 +104,9 @@ def tfs_diff_override() -> str:
         repo_id = f" (id {TFS_DIFF_REPO_ID})" if TFS_DIFF_REPO_ID else ""
         repo_hint = f" Repo {TFS_DIFF_REPO_NAME or '<repo>'}{repo_id}."
     return (
-        " IMPORTANT OVERRIDE - read before planning. This PR may PREDATE the GitHub migration."
-        " If its id does not resolve on GitHub then it exists only in TFS: stop spending turns"
-        " on `gh` or on resolving AB# references. Do NOT write a data-collection script for a"
-        " human to run - you have a working shell, so make the calls yourself."
+        " IMPORTANT OVERRIDE - read before planning. This PR may not resolve through your usual"
+        " PR-diff path (e.g. it predates a migration off TFS). Do NOT write a data-collection"
+        " script for a human to run - you have a working shell, so make the calls yourself."
         " Fetch the diff from the TFS REST API using Windows Integrated Auth"
         " (PowerShell Invoke-RestMethod -UseDefaultCredentials); do not use a stored PAT, which"
         " may be expired." + repo_hint +
@@ -120,20 +118,15 @@ def tfs_diff_override() -> str:
         " file content:  $b/git/repositories/<repoId>/items?path=<path>"
         "&versionDescriptor.version=<commitId>&versionDescriptor.versionType=commit&api-version=3.0 ."
         " Run each call inline rather than from a saved .ps1 - script-file invocation against"
-        " this server is unreliable. Base the analysis on the REAL changed files you retrieve."
+        " this server is unreliable (see docs/adapters/tfs.md). Base the analysis on the REAL"
+        " changed files you retrieve."
     )
 
 
-# core-test-case-generator.md declares "All tools" — grant the concrete set it actually
-# needs (TFS MCP for the story/AC + Playwright MCP if it inspects the live app for grounding).
 GENERATE_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit",
-                   "mcp__playwright__*", "mcp__rp-azure-devops__*", "mcp__rpdevops__*"]
-# core-manual-testcase-executor.md tools: Task, Bash, Read, Write, Grep, Glob, Edit,
-# mcp__playwright__*, mcp__rp-azure-devops__*, mcp__rpdevops__*
-# The draft this replaced only granted mcp__playwright__* here. TC discovery (Step 0.5 in the
-# agent) and env auto-detection both need the TFS MCP servers too, so they're included below.
+                   "mcp__playwright__*", f"{_MCP_TOOL_PREFIX}*"]
 EXECUTE_TOOLS = ["Task", "Bash", "Read", "Write", "Grep", "Glob", "Edit",
-                  "mcp__playwright__*", "mcp__rp-azure-devops__*", "mcp__rpdevops__*"]
+                  "mcp__playwright__*", f"{_MCP_TOOL_PREFIX}*"]
 
 
 def _record_stage(result: StageResult, extra_metadata: dict = None) -> StageResult:
@@ -198,27 +191,26 @@ def _await_artifacts(before: dict, timeout_s: int = 420, poll_s: int = 5) -> tup
 
 
 @observe(type="agent", available_tools=GROOM_TOOLS)
-def stage_groom(story_id: str, story_dir: Path) -> StageResult:
+def stage_groom(ticket_id: str, ticket_dir: Path) -> StageResult:
     before = _snapshot_all(GROOM_DIRS)
     transcript = run_agent_sync(
-        f'Use the Task tool with subagent_type="help-user-story-groomer" to groom the following '
-        f'user story: {story_id}' + SYNC_DIRECTIVE,
+        f'Use the Task tool with subagent_type="{AGENT_GROOM}" to groom the following '
+        f'ticket: {ticket_id}' + SYNC_DIRECTIVE,
         allowed_tools=GROOM_TOOLS,
     )
-    write_stage_log(story_dir, "01-groom", transcript)
+    write_stage_log(ticket_dir, "01-groom", transcript)
     artifacts, wait_ms = _await_artifacts(before)
     return _record_stage(StageResult("groom", ok=bool(artifacts), transcript=transcript,
                                      new_artifacts=artifacts), {"artifact_wait_ms": wait_ms})
 
 
 @observe(type="agent", available_tools=IMPACT_TOOLS)
-def stage_impact(pr_ids, story_dir: Path) -> StageResult:
-    """Analyse EVERY PR behind the story, not just one.
+def stage_impact(pr_ids, ticket_dir: Path) -> StageResult:
+    """Analyse EVERY PR behind the ticket, not just one.
 
-    A Spend feature is delivered across several dev sub-stories, each with its own PR, and the
-    PRs hang off THOSE stories rather than off the QA story itself - so nothing can resolve them
-    from the QA work item alone; the ids have to be supplied. US 2928495 is typical: nine closed
-    dev stories resolving to three distinct PRs (430902, 433487, 434192).
+    A feature can be delivered across several linked PRs rather than one, and those PRs often
+    hang off sub-tickets rather than the top-level ticket itself — so nothing can resolve them
+    automatically; the ids have to be supplied.
 
     Analysing one and reporting on "the feature" would understate the blast radius, so each PR
     gets its own agent call and its own llm span. The stage is ok only if EVERY PR produced a
@@ -232,30 +224,30 @@ def stage_impact(pr_ids, story_dir: Path) -> StageResult:
     transcripts, reported = [], []
     for pr in pr_ids:
         t = run_agent_sync(
-            f'Use the Task tool with subagent_type="core-pr-impact-analyzer" to analyze the '
+            f'Use the Task tool with subagent_type="{AGENT_IMPACT}" to analyze the '
             f'following pull request: {pr}' + tfs_diff_override() + SYNC_DIRECTIVE,
             allowed_tools=IMPACT_TOOLS,
         )
         transcripts.append(f"===== PR {pr} =====\n{t}")
         reported.append(pr)
     transcript = "\n\n".join(transcripts)
-    write_stage_log(story_dir, "02-impact", transcript)
+    write_stage_log(ticket_dir, "02-impact", transcript)
     artifacts, wait_ms = _await_artifacts(before)
 
-    # analyze-pr.md documents a sandboxed-shell fallback: the agent writes a .py/.mjs/.ps1
-    # data-collection script and asks a HUMAN to run it, then re-invoke with "data collected
-    # for {prId}". There is no human in this loop — treat that fallback as a hard stop instead
-    # of silently treating a dropped script as a successful report.
+    # pr-impact-analyzer.md documents a sandboxed-shell fallback: the agent writes a
+    # .py/.mjs/.ps1 data-collection script and asks a HUMAN to run it, then re-invoke with "data
+    # collected for {prId}". There is no human in this loop — treat that fallback as a hard stop
+    # instead of silently treating a dropped script as a successful report.
     if artifacts and all(p.suffix in (".py", ".mjs", ".ps1") for p in artifacts):
         return _record_stage(StageResult(
             "impact", ok=False, transcript=transcript, new_artifacts=artifacts,
-            note="core-pr-impact-analyzer fell back to a data-collection script (shell sandboxed) "
+            note=f"{AGENT_IMPACT} fell back to a data-collection script (shell sandboxed) "
                  "instead of producing a report. This stage cannot complete headlessly as-is.",
         ))
 
     md_reports = [p for p in artifacts if p.suffix == ".md"]
     for md in md_reports:
-        (story_dir / f"impact-{md.stem}.md").write_text(
+        (ticket_dir / f"impact-{md.stem}.md").write_text(
             md.read_text(encoding="utf-8"), encoding="utf-8")
 
     # One report per PR is the bar. Fewer means a PR was silently skipped.
@@ -272,20 +264,20 @@ def stage_impact(pr_ids, story_dir: Path) -> StageResult:
 
 
 @observe(type="agent", available_tools=GENERATE_TOOLS)
-def stage_generate(story_id: str, story_dir: Path, acceptance_criteria: str = ""):
+def stage_generate(ticket_id: str, ticket_dir: Path, acceptance_criteria: str = ""):
     before = _snapshot_all([BUNKER_TESTCASES])
     transcript = run_agent_sync(
-        f'Use the Task tool with subagent_type="core-test-case-generator" to generate test '
-        f'cases for the following user story: {story_id}' + SYNC_DIRECTIVE,
+        f'Use the Task tool with subagent_type="{AGENT_GENERATE}" to generate test '
+        f'cases for the following ticket: {ticket_id}' + SYNC_DIRECTIVE,
         allowed_tools=GENERATE_TOOLS,
         max_turns=80,
     )
-    write_stage_log(story_dir, "03-generate", transcript)
+    write_stage_log(ticket_dir, "03-generate", transcript)
     artifacts, wait_ms = _await_artifacts(before)
     testsuite_json = next((p for p in artifacts if p.name.endswith("-tests.testsuite.json")), None)
 
     if artifacts:
-        gen_dir = story_dir / "generated-tests"
+        gen_dir = ticket_dir / "generated-tests"
         gen_dir.mkdir(exist_ok=True)
         for p in artifacts:
             if p.suffix in (".json", ".md", ".csv"):
@@ -298,7 +290,7 @@ def stage_generate(story_id: str, story_dir: Path, acceptance_criteria: str = ""
         # See pipelines/evals.py: opt-in (PIPELINE_EVALS=1), never fails the stage, and does not
         # yet gate ok/ship-no-ship — this is a new, uncalibrated signal, not a pass/fail gate.
         outcome = evaluate_generate_groundedness(
-            story_id=story_id,
+            ticket_id=ticket_id,
             acceptance_criteria=acceptance_criteria,
             testsuite_text=testsuite_json.read_text(encoding="utf-8"),
         )
@@ -313,16 +305,14 @@ def stage_generate(story_id: str, story_dir: Path, acceptance_criteria: str = ""
 
 
 @observe(type="agent", available_tools=EXECUTE_TOOLS)
-def stage_execute(story_id: str, story_dir: Path) -> StageResult:
+def stage_execute(ticket_id: str, ticket_dir: Path) -> StageResult:
     before = _snapshot_all([BUNKER_EXECUTION])
-    # Work-Item Mode: pass the bare story id so the agent runs ITS OWN TC-discovery chain
-    # (TFS-linked -> local bunker, i.e. exactly what stage_generate just populated) and its own
-    # env auto-detection. The draft this replaced routed through the /execute-tests skill,
-    # which requires planId+suiteId we don't have at this point in the flow — using the agent
-    # directly with a story id is the better-grounded fit for this pipeline.
+    # Work-Item Mode: pass the bare ticket id so the agent runs ITS OWN TC-discovery chain
+    # (linked test cases -> local bunker fallback, i.e. exactly what stage_generate just
+    # populated) and its own environment auto-detection.
     transcript = run_agent_sync(
-        f'Use the Task tool with subagent_type="core-manual-testcase-executor" to execute user '
-        f'story {story_id}' + SYNC_DIRECTIVE,
+        f'Use the Task tool with subagent_type="{AGENT_EXECUTE}" to execute ticket '
+        f'{ticket_id}' + SYNC_DIRECTIVE,
         allowed_tools=EXECUTE_TOOLS,
         # This stage drives a live browser through many steps with mandatory
         # wait+snapshot+screenshot per action — a low generic max_turns will cut it off
@@ -330,19 +320,16 @@ def stage_execute(story_id: str, story_dir: Path) -> StageResult:
         # and raise further if needed (see README "known risks").
         max_turns=200,
     )
-    write_stage_log(story_dir, "04-execute", transcript)
+    write_stage_log(ticket_dir, "04-execute", transcript)
     artifacts, wait_ms = _await_artifacts(before)
 
-    run_dir = story_dir / "run"
+    run_dir = ticket_dir / "run"
     run_dir.mkdir(exist_ok=True)
-    # This stage used to gate on `*-summary.json` and copy `*.html`. Neither can ever exist:
-    # core-manual-testcase-executor.md:43 states the MD report and PDF are its ONLY two
-    # deliverables — "no summary.json, no persisted HTML" — and its own self-check at line
-    # 1150 FAILS the run if a summary.json is found. So execute.ok was hardcoded False by
-    # construction, which forced main() to exit 1 and stage_report to write NO-SHIP on every
-    # run. Gate on the MD report (the documented deliverable) instead, and carry
-    # execution_log.json across as the machine-readable summary — the agent calls it the
-    # "single source of truth" the MD is built from, and it is explicitly not deleted.
+    # Gate on the documented MD report deliverable, and carry both machine-readable artifacts
+    # across: execution_log.json (the per-step working log) and *-summary.json (the agent's
+    # structured pass/fail rollup - counts, per-TC/per-step status, screenshot filenames).
+    # Check your execution agent's own docs for what it actually writes and adjust this gate if
+    # it differs.
     report_md = next((p for p in artifacts if p.name.endswith("-execution-report.md")), None)
     if report_md:
         (run_dir / report_md.name).write_text(
@@ -351,30 +338,34 @@ def stage_execute(story_id: str, story_dir: Path) -> StageResult:
     if exec_log:
         (run_dir / exec_log.name).write_text(
             exec_log.read_text(encoding="utf-8"), encoding="utf-8")
+    summary_json = next((p for p in artifacts if p.name.endswith("-summary.json")), None)
+    if summary_json:
+        (run_dir / summary_json.name).write_text(
+            summary_json.read_text(encoding="utf-8"), encoding="utf-8")
 
     return _record_stage(StageResult("execute", ok=bool(report_md), transcript=transcript,
                                      new_artifacts=artifacts), {"artifact_wait_ms": wait_ms})
 
 
 @observe(name="stage_report")
-def stage_report(story_id: str, story_dir: Path, groom: StageResult,
+def stage_report(ticket_id: str, ticket_dir: Path, groom: StageResult,
                   impact, generate: StageResult, execute: StageResult) -> Path:
     """Synthesize the final ship/no-ship qa-report.md natively — no agent call here.
 
-    The draft this replaced assumed this stage should call automation-report-analyzer /
-    /analyze-report. That agent is grounded specifically in *Extent* HTML reports produced by
-    the Selenium/TestNG suites under src/test/java (its own description says "Extent automation
-    report... browser, OS, Selenium version, hostname"). The execute stage above produces a
-    DIFFERENT report shape — core-manual-testcase-executor's own MD/PDF deliverables plus its
-    internal execution_log.json. Feeding one into the other would misparse it, so this stage
-    reads execute's execution_log.json directly.
-    automation-report-analyzer remains a separate, useful tool for actual `mvn test` /
-    TestNG regression-suite reports — just not for this pipeline's manual-execution stage.
+    The execute stage produces its own MD/PDF deliverables plus two machine-readable artifacts;
+    this stage reads those directly rather than delegating to a separate report-analysis agent,
+    since a generic report-analysis agent tuned for a different report shape (e.g. an
+    automated-test-suite HTML report) would misparse manual-execution output. Prefer
+    *-summary.json (the agent's structured pass/fail rollup) over execution_log.json (the raw
+    per-step working log) when both exist — it's the purpose-built, already-aggregated view.
     """
-    log_path = next((story_dir / "run").glob("execution_log.json"), None)
-    summary = json.loads(log_path.read_text(encoding="utf-8")) if log_path else {}
+    run_dir = ticket_dir / "run"
+    summary_path = next(run_dir.glob("*-summary.json"), None) if run_dir.exists() else None
+    log_path = next(run_dir.glob("execution_log.json"), None) if run_dir.exists() else None
+    source_path = summary_path or log_path
+    summary = json.loads(source_path.read_text(encoding="utf-8")) if source_path else {}
 
-    lines = [f"# QA Report — Story {story_id}", "", "## Stage status"]
+    lines = [f"# QA Report — Ticket {ticket_id}", "", "## Stage status"]
     lines.append(f"- Groom: {'ok' if groom.ok else 'FAILED'}")
     if impact is not None:
         note = f" — {impact.note}" if impact.note else ""
@@ -386,7 +377,7 @@ def stage_report(story_id: str, story_dir: Path, groom: StageResult,
     lines.append("")
 
     if summary:
-        lines.append("## Execution summary (from core-manual-testcase-executor)")
+        lines.append(f"## Execution summary (from {AGENT_EXECUTE})")
         lines.append(f"```json\n{json.dumps(summary, indent=2)}\n```")
         lines.append("")
         lines.append("## Ship / no-ship")
@@ -394,13 +385,13 @@ def stage_report(story_id: str, story_dir: Path, groom: StageResult,
                       "deliberately does not auto-approve a ship decision.")
     else:
         lines.append("## Execution summary")
-        lines.append("No execution_log.json was found under bunker/manual-test-execution — "
-                      "treat this run as INCOMPLETE, not a pass.")
+        lines.append("Neither a *-summary.json nor an execution_log.json was found under "
+                      "bunker/manual-test-execution — treat this run as INCOMPLETE, not a pass.")
         lines.append("")
         lines.append("## Ship / no-ship\nNO-SHIP (incomplete pipeline)")
 
     report_text = "\n".join(lines)
-    out = story_dir / "qa-report.md"
+    out = ticket_dir / "qa-report.md"
     out.write_text(report_text, encoding="utf-8")
 
     if summary:
@@ -427,22 +418,23 @@ def main() -> int:
     nothing. Keeping it out here also gives the root span meaningful arguments instead of ().
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--story-id", required=True)
+    parser.add_argument("--ticket-id", required=True,
+                         help="The work item / issue / user story id to run the pipeline for.")
     parser.add_argument("--pr-id", default=None,
                         help="One PR id, or a comma-separated list. Every PR is analysed "
                              "separately and ALL must produce a report for the stage to pass.")
     args = parser.parse_args()
 
-    story_dir = artifacts_dir(args.story_id)
+    ticket_dir = artifacts_dir(args.ticket_id)
     # deepeval discards traces entirely when no Confident AI key is set, so the local sink is
-    # what makes tracing worth anything here. One file per story, appended per run.
-    set_trace_output(story_dir / "trace.jsonl")
+    # what makes tracing worth anything here. One file per ticket, appended per run.
+    set_trace_output(ticket_dir / "trace.jsonl")
     print(tracing_banner())
     print(evals_banner())
-    print(f"[flow] artifacts -> {story_dir}")
+    print(f"[flow] artifacts -> {ticket_dir}")
 
     try:
-        return run(args.story_id, args.pr_id, story_dir)
+        return run(args.ticket_id, args.pr_id, ticket_dir)
     finally:
         # Explicit rather than trusting interpreter-exit ordering: a background/daemon exporter
         # can be killed mid-flight at shutdown, and the trace that gets dropped is the one you
@@ -451,7 +443,7 @@ def main() -> int:
 
 
 @observe(name="qa_pipeline")
-def run(story_id: str, pr_id, story_dir: Path) -> int:
+def run(ticket_id: str, pr_id, ticket_dir: Path) -> int:
     """The traced root. One pipeline run == one trace."""
     ran, skipped = [], []
 
@@ -461,36 +453,36 @@ def run(story_id: str, pr_id, story_dir: Path) -> int:
         # this the trace would claim a stage failed while containing no span for it at all.
         update_current_trace(
             output=f"exit={code}" + (f" ({note})" if note else ""),
-            metadata={"story_id": story_id, "pr_id": pr_id, "story_dir": str(story_dir),
+            metadata={"ticket_id": ticket_id, "pr_id": pr_id, "ticket_dir": str(ticket_dir),
                       "exit_code": code, "stages_run": ran, "stages_skipped": skipped,
                       "outcome": note or ("ok" if code == 0 else "failed")},
         )
         return code
 
     update_current_trace(
-        name="qa_pipeline", thread_id=str(story_id), tags=["qa-pipeline"],
-        input=f"story_id={story_id} pr_id={pr_id}",
-        metadata={"story_id": story_id, "pr_id": pr_id, "story_dir": str(story_dir)},
+        name="qa_pipeline", thread_id=str(ticket_id), tags=["qa-pipeline"],
+        input=f"ticket_id={ticket_id} pr_id={pr_id}",
+        metadata={"ticket_id": ticket_id, "pr_id": pr_id, "ticket_dir": str(ticket_dir)},
     )
 
-    groom = stage_groom(story_id, story_dir); ran.append("groom")
+    groom = stage_groom(ticket_id, ticket_dir); ran.append("groom")
     print(f"[flow] groom: {'OK' if groom.ok else 'NO ARTIFACT FOUND'}")
 
     impact = None
     if pr_id:
-        impact = stage_impact(pr_id, story_dir); ran.append("impact")
+        impact = stage_impact(pr_id, ticket_dir); ran.append("impact")
         suffix = f" — {impact.note}" if impact.note else ""
         print(f"[flow] impact: {'OK' if impact.ok else 'FAILED'}{suffix}")
         if not impact.ok:
             print("[flow] stopping: impact analysis stage did not produce a usable report.")
             skipped += ["generate", "execute"]
-            stage_report(story_id, story_dir, groom, impact,
+            stage_report(ticket_id, ticket_dir, groom, impact,
                          StageResult("generate", False, ""), StageResult("execute", False, ""))
             return finish(1, "impact stage produced no usable report")
     else:
         skipped.append("impact")
 
-    # groom's artifacts are never copied into story_dir the way impact's/generate's are (see the
+    # groom's artifacts are never copied into ticket_dir the way impact's/generate's are (see the
     # GROOM_DIRS comment above), so read them straight from groom.new_artifacts here — the only
     # place those Path objects are in scope. Feeds stage_generate's groundedness eval; a failed
     # groom (groom.ok=False) leaves this empty and the eval reports "no context" rather than
@@ -499,18 +491,18 @@ def run(story_id: str, pr_id, story_dir: Path) -> int:
         p.read_text(encoding="utf-8") for p in groom.new_artifacts if p.suffix == ".md"
     ) if groom.ok else ""
 
-    generate, testsuite_json = stage_generate(story_id, story_dir, acceptance_criteria); ran.append("generate")
+    generate, testsuite_json = stage_generate(ticket_id, ticket_dir, acceptance_criteria); ran.append("generate")
     print(f"[flow] generate: {'OK' if generate.ok else 'NO TESTSUITE JSON FOUND'}")
     if not generate.ok:
         print("[flow] stopping: no test cases were generated to execute.")
         skipped.append("execute")
-        stage_report(story_id, story_dir, groom, impact, generate, StageResult("execute", False, ""))
+        stage_report(ticket_id, ticket_dir, groom, impact, generate, StageResult("execute", False, ""))
         return finish(1, "no test cases generated")
 
-    execute = stage_execute(story_id, story_dir); ran.append("execute")
+    execute = stage_execute(ticket_id, ticket_dir); ran.append("execute")
     print(f"[flow] execute: {'OK' if execute.ok else 'NO EXECUTION REPORT FOUND'}")
 
-    report_path = stage_report(story_id, story_dir, groom, impact, generate, execute)
+    report_path = stage_report(ticket_id, ticket_dir, groom, impact, generate, execute)
     ran.append("report")
     print(f"[flow] qa-report -> {report_path}")
     return finish(0 if execute.ok else 1)

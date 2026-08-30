@@ -1,0 +1,48 @@
+{
+  "project": {
+    "name": "your-project",
+    "workItemSystem": "tfs"
+  },
+  "backend": {
+    "type": "tfs",
+    "orgUrlEnv": "TFS_ORG_URL",
+    "projectNameEnv": "TFS_PROJECT",
+    "mcpToolPrefix": "mcp__your-pm-tool__",
+    "authNotes": "see docs/adapters/tfs.md"
+  },
+  "agents": {
+    "_comment": "subagent_type strings for flow.py's headless stages, matching .claude/agents/*.md. Override if you rename an agent file's frontmatter `name`.",
+    "groom": "us-eval",
+    "impact": "pr-impact-analyzer",
+    "generate": "test-case-generation-agent",
+    "execute": "manual-test-execution-agent"
+  },
+  "repos": {
+    "automationRepoRoot": "/path/to/your/automation/repo",
+    "pageObjectsPath": "src/test/java/com/yourorg/pages/",
+    "repoMap": [
+      { "name": "acme-web-ui", "path": "acme-web-ui" }
+    ]
+  },
+  "environments": {
+    "branchMapping": {
+      "main": "prod",
+      "develop": "staging"
+    },
+    "default": "staging"
+  },
+  "apps": [
+    {
+      "name": "ExampleApp",
+      "urls": {
+        "staging": "https://staging.example.com",
+        "prod": "https://app.example.com"
+      },
+      "credentialSource": "env:EXAMPLE_APP_USER,EXAMPLE_APP_PASS"
+    }
+  ],
+  "database": {
+    "connectionStringEnv": "QA_DB_CONNECTION",
+    "notes": "optional stage - configure per project, or omit if there is no backend DB to verify"
+  }
+}

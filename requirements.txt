@@ -8,9 +8,9 @@
 
 claude-agent-sdk==0.2.116   # pinned: pipelines/common.py is verified against this exact version.
                             # Also the judge backend for pipelines/evals.py's LLM-judge metrics
-                            # (a custom DeepEvalBaseLLM, not deepeval's AnthropicModel) — RealPage's
-                            # Claude Console org has self-serve API-key creation disabled, so evals
-                            # reuse this SDK's own (Claude Code / claude.ai) login instead.
+                            # (a custom DeepEvalBaseLLM, not deepeval's AnthropicModel) — a
+                            # standalone Anthropic Console API key isn't always available, so
+                            # evals reuse this SDK's own (Claude Code / claude.ai) login instead.
 deepeval==4.2.0             # tracing (pipelines/tracing.py) + LLM-judge evals (pipelines/evals.py).
                             # No Confident AI account and no separate Anthropic API key needed.
 requests                    # used by upload_test_cases.py (currently missing on the system python)

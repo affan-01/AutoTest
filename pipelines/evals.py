@@ -13,12 +13,11 @@ unavailable, every helper here becomes a no-op and flow.py keeps running with ev
 absent from the trace/report — an eval outage must never fail the pipeline.
 
 The judge model is `_ClaudeAgentSdkModel` below, NOT deepeval's built-in `AnthropicModel`.
-AnthropicModel requires a standalone Anthropic Console API key; RealPage's Claude Console org
-has self-serve API-key creation disabled and org admins declined to create one for this specific
-use case (2026-08-28). Every other stage in this pipeline already authenticates through the
-Claude Agent SDK's own (Claude Code / claude.ai) login with no separate key at all — see
-pipelines/common.py::run_agent — so the judge reuses that exact, already-approved mechanism
-instead of depending on a credential this org will not grant.
+AnthropicModel requires a standalone Anthropic Console API key, which not every org grants
+self-serve (and getting one issued can be its own approval process). Every other stage in this
+pipeline already authenticates through the Claude Agent SDK's own (Claude Code / claude.ai)
+login with no separate key at all — see pipelines/common.py::run_agent — so the judge reuses
+that exact mechanism instead of depending on a credential you may not have.
 
 Evals are opt-in via PIPELINE_EVALS=1, separately from PIPELINE_TRACING=1. Unlike tracing (which
 is free once deepeval is installed), every call here is a real judge-model request that consumes
@@ -177,9 +176,9 @@ def _measure(name: str, build) -> EvalOutcome:
                         success=bool(metric.success), reason=metric.reason or "")
 
 
-def evaluate_generate_groundedness(story_id: str, acceptance_criteria: str,
+def evaluate_generate_groundedness(ticket_id: str, acceptance_criteria: str,
                                     testsuite_text: str) -> Optional[EvalOutcome]:
-    """Judge whether stage_generate's test cases are grounded in the story's real AC.
+    """Judge whether stage_generate's test cases are grounded in the ticket's real AC.
 
     Returns None only when evals are disabled/unavailable (a categorically different case from
     "we tried and it failed") — that distinction matters in the trace: None means "not attempted",
@@ -213,7 +212,7 @@ def evaluate_generate_groundedness(story_id: str, acceptance_criteria: str,
             ),
         )
         test_case = _LLMTestCase(
-            input=f"Story {story_id} acceptance criteria:\n{acceptance_criteria[:_MAX_CONTEXT_CHARS]}",
+            input=f"Ticket {ticket_id} acceptance criteria:\n{acceptance_criteria[:_MAX_CONTEXT_CHARS]}",
             actual_output=testsuite_text[:_MAX_OUTPUT_CHARS],
             context=[acceptance_criteria[:_MAX_CONTEXT_CHARS]],
         )

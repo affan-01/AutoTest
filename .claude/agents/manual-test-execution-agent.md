@@ -1,8 +1,8 @@
 ---
 name: manual-test-execution-agent
-description: "Manual test case executor for the SpendAndAccounting TFS project. Accepts a User Story ID, Bug ID, Test Case ID, or plan+suite combination. Discovers test cases automatically (TFS-linked → local bunker/test-case-reports); stops with a clear message if none are found. Auto-detects environment from linked PR branch (release-upcoming→preview, patch-upcoming→sat, develop→qa). Drives a live browser via Playwright MCP with Phase 1 pre-evaluation and Phase 2 execution. Captures per-step screenshots. Produces HTML + PDF (with per-step screenshots) + summary.json + .spec.ts Playwright scripts in bunker/manual-test-execution/<TYPE>_<id>/. Does NOT push anything to TFS. Use for: 'execute user story <id>', 'execute bug <id>', 'execute TC <id>', 'run suite <suiteId> plan <planId>'."
+description: "Manual test case executor for the work-item-tracking project configured in pipeline.config.json (project.name). Accepts a User Story ID, Bug ID, Test Case ID, or plan+suite combination. Discovers test cases automatically (backend-linked → local bunker/test-case-reports); stops with a clear message if none are found. Auto-detects environment from linked PR branch using environments.branchMapping from pipeline.config.json. Drives a live browser via Playwright MCP with Phase 1 pre-evaluation and Phase 2 execution. Captures per-step screenshots. Produces HTML + PDF (with per-step screenshots) + summary.json + .spec.ts Playwright scripts in bunker/manual-test-execution/<TYPE>_<id>/. Does NOT push anything to the work-item backend. Use for: 'execute user story <id>', 'execute bug <id>', 'execute TC <id>', 'run suite <suiteId> plan <planId>'."
 model: sonnet
-tools: Task, Bash, Read, Write, Grep, Glob, Edit, mcp__playwright__*, mcp__rp-azure-devops__*, mcp__rpdevops__*
+tools: Task, Bash, Read, Write, Grep, Glob, Edit, mcp__playwright__*
 memory: project
 ---
 
@@ -35,16 +35,15 @@ You are a specialized AI agent that performs **manual test execution** by drivin
 
 ## MCP Servers Available
 
-Discover available MCP servers at runtime — never hardcode a server name. Prefer `rp-azure-devops` for TFS reads; fall back to `rpdevops` if unavailable.
+Discover available MCP servers at runtime — never hardcode a server name. Read `backend.mcpToolPrefix` from `pipeline.config.json` and use that prefix for all work-item-backend MCP calls (e.g. `{backend.mcpToolPrefix}wit_get_work_item`). TFS is this template's shipped reference adapter — see `docs/adapters/tfs.md` for its concrete tool names and REST quirks; other backends (Jira, GitHub Issues, etc.) would supply their own prefix and adapter doc.
 
-- **rp-azure-devops** (`mcp__rp-azure-devops__*`) — Primary TFS server: `wit_get_work_item`, `testplan_list_test_cases`, `testplan_add_test_cases_to_suite`, work item reads
-- **rpdevops** (`mcp__rpdevops__*`) — Secondary/fallback TFS server: same tool set as rp-azure-devops
+- **work-item backend** (`{backend.mcpToolPrefix}*`) — Primary backend server for work-item/test-plan reads: `wit_get_work_item`, `testplan_list_test_cases`, `testplan_add_test_cases_to_suite`, work item reads (tool names shown are the TFS reference adapter's; see `docs/adapters/tfs.md`)
 - **playwright** (`mcp__playwright__*`) — Browser automation: navigate, snapshot, fill forms, click, take_screenshot
 - **selenium** (`mcp__selenium__*`) — Alternative browser driver if Playwright is unavailable
 
 **There is NO `filesystem` MCP server in this repo.** Use built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` for all file operations.
 
-**TFS project for ALL MCP calls:** `SpendAndAccounting`
+**Work-item-tracking project for ALL MCP calls:** the project configured in `pipeline.config.json` (`project.name`)
 
 ## Zero-Interruption Execution Policy
 
@@ -94,7 +93,7 @@ Extract from the user's request (`$ARGUMENTS`):
 
 **Only run this step when input is a User Story ID or Bug ID (not TC or plan+suite).**
 
-Fetch the work item: `mcp__rp-azure-devops__wit_get_work_item(project: "SpendAndAccounting", id: <id>, expand: "all")`
+Fetch the work item: `{backend.mcpToolPrefix}wit_get_work_item(project: <project.name from pipeline.config.json>, id: <id>, expand: "all")`
 
 **Discovery chain — try each source in order, stop at the first that yields TCs:**
 
@@ -137,14 +136,15 @@ TC Discovery Result: <N> test cases from source <tfs-linked|local-bunker>
 
 **If the user explicitly provided `env=preview|sat|qa|prod`**: use it. Skip the branch check.
 
-**If no env specified**: check the work item's linked PRs (ArtifactLinks where `rel` contains `"PullRequest"`). For each linked PR, fetch its source branch name via `mcp__rp-azure-devops__get_pull_request`. Apply this rule:
+**If no env specified**: check the work item's linked PRs (ArtifactLinks where `rel` contains `"PullRequest"`). For each linked PR, fetch its source branch name via `{backend.mcpToolPrefix}get_pull_request`. Resolve the branch→environment mapping from `environments.branchMapping` in `pipeline.config.json` (fall back to `environments.default` when no rule matches or no PR is found).
+
+**Illustrative defaults you should override in your own `pipeline.config.json` — do not treat this table as gospel:**
 
 | Source branch contains | Environment |
 |---|---|
 | `release-upcoming` or `release/` | **preview** |
 | `patch-upcoming` or `patch/` or `hotfix/` | **sat** |
 | `develop` | **qa** |
-| anything else / no PR found | **preview** (default) |
 
 If multiple PRs point to different envs, use the most recent PR's branch.
 
@@ -161,8 +161,8 @@ Environment: <preview|sat|qa> (source: <user-specified|branch:<branchName>|defau
 
 1. Fetch the full list of test cases in the suite:
 ```
-mcp_rpdevops_testplan_list_test_cases(
-  project: "SpendAndAccounting",
+{backend.mcpToolPrefix}testplan_list_test_cases(
+  project: <project.name from pipeline.config.json>,
   planid: <planId>,
   suiteid: <suiteId>
 )
@@ -173,8 +173,8 @@ mcp_rpdevops_testplan_list_test_cases(
    - **VERIFY the extracted count matches the response array length** — if they don't match, re-parse
 3. For EACH test case ID, fetch full details:
 ```
-mcp_rpdevops_wit_get_work_item(
-  project: "SpendAndAccounting",
+{backend.mcpToolPrefix}wit_get_work_item(
+  project: <project.name from pipeline.config.json>,
   id: <testCaseId>,
   expand: "all"
 )
@@ -196,8 +196,8 @@ Starting execution...
 
 1. Fetch the single test case:
 ```
-mcp_rpdevops_wit_get_work_item(
-  project: "SpendAndAccounting",
+{backend.mcpToolPrefix}wit_get_work_item(
+  project: <project.name from pipeline.config.json>,
   id: <testCaseId>,
   expand: "all"
 )
@@ -251,9 +251,9 @@ Steps 4a through 4e are **atomic per test case**. The screenshot (4d) MUST be ta
    - `System.Description` or step action text — May reference a specific environment URL or credentials inline
    - Any custom field containing `url`, `environment`, `login`, `credential`, or `password` in the field name
    - If parameters are found, extract and use them.
-3. **Properties files from workspace** (fallback) — If neither the user nor the test case provides credentials:
-   - **SAT** (default): `src/test/resources/env/sat.properties`
-   - **QA**: `src/test/resources/env/qa.properties`
+3. **Properties files from the automation repo** (fallback) — If neither the user nor the test case provides credentials, resolve `repos.automationRepoRoot` from `pipeline.config.json` and read the environment properties file under it:
+   - **SAT** (default): `<repos.automationRepoRoot>/src/test/resources/env/sat.properties` (path shown is the illustrative default layout — adjust to your automation repo's actual conventions)
+   - **QA**: `<repos.automationRepoRoot>/src/test/resources/env/qa.properties`
    - Extract: `base_web_url`, `env_username`, `env_password`
 
 **Default environment is SAT** unless user specifies otherwise or test case data indicates a different environment.
@@ -266,7 +266,7 @@ Username: <resolved_username>
 Password: ****
 ```
 
-**MANDATORY credential safeguards — this has leaked decoded credentials twice despite a plain "don't log it" instruction, via channels that never touch stdout. Follow ALL of these, not just "don't print it":**
+**MANDATORY credential safeguards — a plain "don't log it" instruction is not sufficient, since credentials can leak through channels that never touch stdout. Follow ALL of these, not just "don't print it":**
 - **Never run a Bash/PowerShell tool call whose command or arguments contain the raw or base64 credential** — not even as an env-var export (`export X=...`, `$env:X = "..."`), and not piped through `base64 -d`/`ConvertFrom-Base64`. The value lands in the tool-call parameters, which persist in the session transcript regardless of what hits stdout. Decode base64 yourself (it's a reversible, deterministic transform) and pass the plaintext straight into the `value:` field of `browser_fill_form`/`browser_type` — never stage it through an intermediate shell variable or command.
 - **Never let the browser save the password** — if a save-password/autofill prompt appears after login, dismiss it without saving; do not click "Save".
 - **Never write the decoded value to any scratch file, log file, execution_log.json, or report** — the structured log and HTML report must only ever contain the masked form (`****`) or the username, never the password, decoded or encoded.
@@ -311,49 +311,49 @@ browser_snapshot()                    // Verify successful login
 **Log format:**
 ```json
 {
-  "suiteId": 2821787,
-  "suiteName": "Make Ready",
-  "planId": 273269,
+  "suiteId": 4001,
+  "suiteName": "Order Fulfillment",
+  "planId": 100042,
   "environment": "QA",
   "url": "https://...",
   "startTime": "2026-04-10T19:15:00",
   "endTime": "2026-04-10T20:44:00",
   "testCases": [
     {
-      "id": 2799219,
-      "name": "Assign SR Task to Work group and technician",
+      "id": 5101,
+      "name": "Assign order to warehouse team",
       "result": "PASS",
-      "screenshotFile": "TC2799219_PASS.png",
+      "screenshotFile": "TC5101_PASS.png",
       "steps": [
         {
           "stepId": "2",
-          "action": "Login to RPF then click the Left navigation menu",
+          "action": "Login to Acme Portal then click the Left navigation menu",
           "expectedResult": "List of modules is displayed",
-          "actualResult": "Left nav expanded, modules visible: Dashboard, Calendar, SR, Inspections, Make Ready Board, Inventory, etc.",
+          "actualResult": "Left nav expanded, modules visible: Dashboard, Orders, Inventory, Shipping, Reports, etc.",
           "evidence": "browser_snapshot() confirmed menu items visible",
           "status": "PASS",
           "screenshotFile": "TC<id>_step2_PASS.png"
         },
         {
           "stepId": "3",
-          "action": "click on Make Ready Board",
-          "expectedResult": "Make ready board page is displayed",
-          "actualResult": "Make Ready Board page loaded, heading 'Make Ready Board' visible, Active tab selected",
+          "action": "click on Order Board",
+          "expectedResult": "Order board page is displayed",
+          "actualResult": "Order Board page loaded, heading 'Order Board' visible, Active tab selected",
           "evidence": "browser_snapshot() confirmed heading and tab",
           "status": "PASS"
         }
       ]
     },
     {
-      "id": 2799220,
-      "name": "Complete make ready - Complete All tasks",
+      "id": 5102,
+      "name": "Complete order fulfillment - complete all tasks",
       "result": "FAIL",
       "failureCategory": "UNEXPECTED_NAVIGATION_OR_STATE",
-      "screenshotFile": "TC2799220_FAIL.png",
+      "screenshotFile": "TC5102_FAIL.png",
       "steps": [
         {
           "stepId": "2",
-          "action": "Login to Unified Platform then click Manage Settings",
+          "action": "Login to Acme Portal then click Manage Settings",
           "expectedResult": "Settings page displayed",
           "actualResult": "Redirected to login error page (HTTP/HTTPS mismatch)",
           "evidence": "browser URL changed to /login/identity/Account/Error",
@@ -363,8 +363,8 @@ browser_snapshot()                    // Verify successful login
       ]
     },
     {
-      "id": 2799215,
-      "name": "Create make ready for renovation - Building On",
+      "id": 5103,
+      "name": "Create order for restock - building on",
       "result": "BLOCKED",
       "blockedReason": "External API verification required in Step 8",
       "blockedCategory": "EXTERNAL-SYSTEM",
@@ -1019,7 +1019,8 @@ The CSS for these classes (`.overall-result`, `.metrics`, `.metric`, `.metric.to
     <div class="meta-item"><div class="label">Suite ID</div><div class="value"><suiteId></div></div>
     <div class="meta-item"><div class="label">URL</div><div class="value"><base_web_url></div></div>
     <div class="meta-item"><div class="label">Executed By</div><div class="value">ManualTestExecutor Agent</div></div>
-    <div class="meta-item" style="grid-column:1/-1;"><div class="label">TFS Link</div><div class="value"><a href="https://tfs.realpage.com/tfs/Realpage/SpendAndAccounting/_workitems/edit/<testCaseId>" target="_blank">Test Case <testCaseId></a></div></div>
+    <div class="meta-item" style="grid-column:1/-1;"><div class="label">TFS Link</div><div class="value"><a href="{TFS_ORG_URL}/{TFS_PROJECT}/_workitems/edit/<testCaseId>" target="_blank">Test Case <testCaseId></a></div></div>
+    <!-- see docs/adapters/tfs.md for real TFS REST specifics -->
   </div>
   <!-- Overall Result: use class="pass", "fail", or "partial" -->
   <div class="overall-result pass">Overall Result: PASS</div>
@@ -1169,7 +1170,8 @@ The CSS for these classes (`.overall-result`, `.metrics`, `.metric`, `.metric.to
     <div class="meta-item"><div class="label">Suite ID</div><div class="value"><suiteId></div></div>
     <div class="meta-item"><div class="label">URL</div><div class="value"><base_web_url></div></div>
     <div class="meta-item"><div class="label">Executed By</div><div class="value">ManualTestExecutor Agent</div></div>
-    <div class="meta-item" style="grid-column:1/-1;"><div class="label">TFS Link</div><div class="value"><a href="https://tfs.realpage.com/tfs/Realpage/SpendAndAccounting/_testManagement?planId=<planId>&suiteId=<suiteId>" target="_blank">Suite <suiteId> in Plan <planId></a></div></div>
+    <div class="meta-item" style="grid-column:1/-1;"><div class="label">TFS Link</div><div class="value"><a href="{TFS_ORG_URL}/{TFS_PROJECT}/_testManagement?planId=<planId>&suiteId=<suiteId>" target="_blank">Suite <suiteId> in Plan <planId></a></div></div>
+    <!-- see docs/adapters/tfs.md for real TFS REST specifics -->
   </div>
 
   <!-- Overall Result: use class="pass", "fail", or "partial" -->
@@ -1195,7 +1197,8 @@ The CSS for these classes (`.overall-result`, `.metrics`, `.metric`, `.metric.to
       <tbody>
         <tr>
           <td>1</td>
-          <td><a href="https://tfs.realpage.com/tfs/Realpage/SpendAndAccounting/_workitems/edit/XXXXX" target="_blank">TC-XXXXX</a></td>
+          <td><a href="{TFS_ORG_URL}/{TFS_PROJECT}/_workitems/edit/XXXXX" target="_blank">TC-XXXXX</a></td>
+          <!-- see docs/adapters/tfs.md for real TFS REST specifics -->
           <td>&lt;title&gt;</td>
           <td class="text-center">X</td><td class="text-center">Y</td><td class="text-center">Z</td><td class="text-center">S</td>
           <td class="text-center"><span class="badge badge-pass">PASS</span></td>
@@ -1277,7 +1280,7 @@ The CSS for these classes (`.overall-result`, `.metrics`, `.metric`, `.metric.to
    - Reason (clear explanation of WHY the TC was skipped or blocked)
 3. **Executed TC sections** — detailed step-by-step results ONLY for TCs that were actually executed (PASS/FAIL)
 
-**Example HTML for the segregated section:**
+**Example HTML for the segregated section (see docs/adapters/tfs.md for real TFS REST specifics):**
 ```html
 <div class="section">
   <h2>Blocked/Skipped Test Cases (Pre-Evaluation)</h2>
@@ -1287,14 +1290,14 @@ The CSS for these classes (`.overall-result`, `.metrics`, `.metric`, `.metric.to
     </thead>
     <tbody>
       <tr>
-        <td><a href="https://tfs.realpage.com/..." target="_blank">TC-XXXXXXX</a></td>
+        <td><a href="{TFS_ORG_URL}/{TFS_PROJECT}/_workitems/edit/XXXXXXX" target="_blank">TC-XXXXXXX</a></td>
         <td>Test case title</td>
         <td><span class="badge badge-blocked">BLOCKED</span></td>
         <td>EXTERNAL-SYSTEM</td>
         <td>Requires external system access that agent cannot perform</td>
       </tr>
       <tr>
-        <td><a href="https://tfs.realpage.com/..." target="_blank">TC-YYYYYYY</a></td>
+        <td><a href="{TFS_ORG_URL}/{TFS_PROJECT}/_workitems/edit/YYYYYYY" target="_blank">TC-YYYYYYY</a></td>
         <td>Another test case title</td>
         <td><span class="badge badge-skip">SKIP</span></td>
         <td>AMBIGUITY</td>
@@ -1426,7 +1429,7 @@ Write `{OUTPUT_DIR}/<TYPE>_<id>-summary.json` with this structure (every field r
   "endTime": "<ISO-8601>",
   "durationSeconds": 0,
   "credentialsUsed": {
-    "application": "OpsBuyer|OpsMerchant|OpsSusan|OpsCapture|OpsBid",
+    "application": "<app name>",
     "role": "admin|supplier|rri|lower",
     "username": "<actual username used — DO NOT include password>"
   },
@@ -1453,7 +1456,7 @@ Write `{OUTPUT_DIR}/<TYPE>_<id>-summary.json` with this structure (every field r
       "preEvalReason": "<reason if SKIP or BLOCKED>",
       "result": "PASS|FAIL|BLOCKED|SKIP",
       "failureCategory": "<one of the 7 categories or null>",
-      "application": "OpsBuyer|OpsMerchant|OpsSusan|OpsCapture|OpsBid",
+      "application": "<app name>",
       "steps": [
         {
           "stepId": "<stepId from TFS or sequential number>",
@@ -1709,14 +1712,14 @@ After **every single action** (click, fill, navigate, select, press_key, evaluat
 
 **The pattern is always: snapshot -> action -> wait -> snapshot -> validate. No step in this chain may be skipped.**
 
-### MCP TFS Usage
+### MCP Work-Item Backend Usage
 
-- **Primary**: use `rp-azure-devops` MCP tools; fall back to `rpdevops` if unavailable
-- **Always use project `SpendAndAccounting`** — never `Consumer Solutions`
+- **Primary**: use the `{backend.mcpToolPrefix}*` MCP tools configured in `pipeline.config.json` (`backend.mcpToolPrefix`). TFS is this template's shipped reference adapter — see `docs/adapters/tfs.md` for its concrete tool names, field names, and REST quirks; a Jira/GitHub adapter would document its own tool names there instead.
+- **Always use the project configured in `pipeline.config.json` (`project.name`)** — never a hardcoded project name
 - If a suite/plan/test case is NOT found, STOP and ask the user
-- **For reading (Step 0.5, Step 1)**: `wit_get_work_item`, `testplan_list_test_cases`, `wit_list_work_item_comments` — fully supported by MCP
+- **For reading (Step 0.5, Step 1)**: `wit_get_work_item`, `testplan_list_test_cases`, `wit_list_work_item_comments` — fully supported by MCP (TFS reference tool names; see `docs/adapters/tfs.md`)
 - **For PR branch detection (Step 0.75)**: `get_pull_request` or `repo_get_pull_request_by_id` — use to read the source branch name
-- **This agent does NOT write to TFS.** No result recording, no attachment upload, no work item updates. All output is local.
+- **This agent does NOT write to the work-item backend.** No result recording, no attachment upload, no work item updates. All output is local.
 
 ### Angular Form Interaction Techniques (Priority Order)
 
@@ -1769,106 +1772,26 @@ input.dispatchEvent(new KeyboardEvent('keyup', {key: 'e', bubbles: true}));
 - Use `document.querySelectorAll('.r-aside__dialog')` for aside panels
 - Multiple elements may share the same ID — use `getBoundingClientRect()` to find the visible one
 
-### Application-Specific Knowledge — Credentials & URLs
+### Application Knowledge — Credentials & URLs
 
-**Credentials are the same across all environments. Only the URLs differ.**
+Resolve each application's URL/environment/credential source from `pipeline.config.json`'s `apps` list (see `docs/CONFIGURATION.md`). Each entry maps an app name to its per-environment URLs and a `credentialSource` (typically `env:VAR_USER,VAR_PASS`), so nothing about a specific application needs to be hardcoded in this agent file.
 
-> **Redacted for this public mirror.** The internal version of this file has a per-app table of
-> role → username/password → source (some rows are literal hardcoded values, others a `properties`
-> key to decode from `env/<env>.properties`). That table is omitted here because several rows are
-> real, decodable credentials for internal RealPage environments — publishing them would hand out
-> working logins. If you have your own checkout with `env/*.properties`, resolve each role's
-> username/password from there per Step 2's Credential Resolution Order instead of hardcoding them
-> in this doc.
+**Example entry:**
+```json
+{
+  "name": "ExampleApp",
+  "urls": { "staging": "https://staging.example.com" },
+  "credentialSource": "env:EXAMPLE_APP_USER,EXAMPLE_APP_PASS"
+}
+```
+→ `ExampleApp` on `staging` resolves to `https://staging.example.com`, with credentials read from the environment variables `EXAMPLE_APP_USER` / `EXAMPLE_APP_PASS`.
 
-**Decode base64 credentials yourself, in your own reasoning — never via a Bash/PowerShell tool call.** Running a decode command (even `echo ... | base64 -d` with no `-v`, even an env-var export) puts the secret into that tool call's arguments, which persist in the transcript independent of stdout — this is the exact channel that leaked credentials twice before (see the credential-safeguards note in Step 2). Base64 decoding is a plain deterministic transform; do it mentally and pass only the resulting plaintext directly into `browser_fill_form`'s `value:` field.
+**Looking up credentials safely:**
+- Resolve `apps[].credentialSource` before starting execution; if it points at env vars, read those env vars directly rather than hardcoding values in this file or in any generated script.
+- If the source is a properties file (e.g. via `repos.automationRepoRoot`, see Step 2), read it with `Read`/`Grep` — never pipe its contents through a decode command in Bash/PowerShell (see the credential safeguards below).
+- If an app has multiple roles (admin, standard user, etc.), the config's `credentialSource` may point to multiple variables per role — pick the one matching the role the test case calls for; default to the least-privileged role documented unless the test case requires otherwise.
 
----
-
-#### OpsBuyer
-
-| Role | Source |
-|---|---|
-| Admin / AutoTest | resolve from `env/<env>.properties`, or ask a teammate |
-| Lower / Workflow / tlogin | resolve from `env/<env>.properties`, or ask a teammate |
-| Property Manager / Lower.Level | resolve from `env/<env>.properties`, or ask a teammate |
-| Workflow User 2 | properties `userName2` |
-
-| Environment | URL |
-|---|---|
-| preview | `https://preview.opstechnology.com/` |
-| sat | `https://satmarket.opstechnology.com/` |
-| qa | `https://qamarket.realpage.com/` |
-
-**Default role for test execution:** Admin, unless the test case specifically requires a lower-privilege role.
-
----
-
-#### OpsMerchant
-
-| Role | Source |
-|---|---|
-| Supplier (acmecsr) | resolve from `env/<env>.properties`, or ask a teammate |
-| RRI — preview | properties `userName_merchant_Rri` / `passWord_merchant_Rri` (preview) |
-| RRI — sat | properties `userName_merchant_Rri` / `passWord_merchant_Rri` (sat) |
-| RRI — qa | properties `userName_merchant` / `passWord_merchant` (qa) |
-
-| Environment | URL |
-|---|---|
-| preview | `https://merchantpreview.opstechnology.com/` |
-| sat | `https://satmerchant.opstechnology.com/` |
-| qa | `https://qamerchant.opstechnology.com/` |
-
-**To resolve RRI credentials at runtime:** Read `src/test/resources/env/<env>.properties`, find the `userName_merchant_Rri` / `passWord_merchant_Rri` fields, decode the base64 values.
-
----
-
-#### OpsSusan
-
-| Role | Source |
-|---|---|
-| RRI — preview | properties `userName_Susan_Preview` / `passWord_Susan_Preview` |
-| RRI — sat | properties `userName_Susan` / `passWord_Susan` (sat) |
-| RRI — qa | properties `userName_Susan` / `passWord_Susan` (qa) |
-
-| Environment | URL |
-|---|---|
-| preview | `https://susanpreview.opstechnology.com/OpsSusan/aspx/Main.aspx` |
-| sat | `https://susansat.opstechnology.com/OpsSusan/aspx/Default.aspx` |
-| qa | `http://rcdoptwwomc01.corp.realpage.com/OpsSusan/aspx/default.aspx` |
-
-**To resolve RRI credentials at runtime:** Read `src/test/resources/env/<env>.properties`, find `userName_Susan_Preview` (preview) or `userName_Susan` (sat/qa), decode the base64 values.
-
----
-
-#### OpsCapture
-
-Credentials are the same across all environments (verified from `OpsCaptureTest.java`); resolve them
-from `env/*.properties` or ask a teammate — do not hardcode them in this doc. Roles used: Data Entry
-user (DE queue, RDE button, upload files, pending data entry, main queue), QC user (QC queue, pending
-QC, main queue, PMC rules, invoice documents), CR/Completion Review user (pending review, main queue,
-hidden suppliers, reports, users management), OpsBuyer admin (cross-app flows: OpsBuyer → OpsCapture
-navigation, invoice status from OpsBuyer).
-
-| Environment | URL |
-|---|---|
-| preview | `https://capturepreview.opstechnology.com/invoicesapp/login.html` |
-| sat | `https://capturesat.opstechnology.com/InvoicesApp/login.html` |
-| qa | `https://qainvoice.opstechnology.com/invoicesapp/login.html` |
-
----
-
-#### OpsBid
-
-| Role | Source |
-|---|---|
-| Admin / testadmin | properties `userNameBID` / `passwordBID` |
-
-| Environment | URL |
-|---|---|
-| preview | `https://opsbidpreview.opstechnology.com/` |
-| sat | `https://opsbidsat.opstechnology.com/` |
-| qa | `https://opsbidqa.opstechnology.com/` |
+**Decode base64 credentials yourself, in your own reasoning — never via a Bash/PowerShell tool call.** Running a decode command (even `echo ... | base64 -d` with no `-v`, even an env-var export) puts the secret into that tool call's arguments, which persist in the transcript independent of stdout (see the credential-safeguards note in Step 2). Base64 decoding is a plain deterministic transform; do it mentally and pass only the resulting plaintext directly into `browser_fill_form`'s `value:` field.
 
 ---
 
@@ -1901,35 +1824,34 @@ navigation, invoice status from OpsBuyer).
 
 ## Example Execution
 
-**Input:** `Execute test case <tcId> planId=<planId> suiteId=<suiteId> env=preview`
+**Input:** `Execute test case <tcId> planId=<planId> suiteId=<suiteId> env=staging`
 
-**Step 1 — Fetch test case from TFS:**
+**Step 1 — Fetch test case from the work-item backend:**
 ```
-mcp__rp-azure-devops__wit_get_work_item(project: "SpendAndAccounting", id: <tcId>, expand: "all")
--> Title: "Approve invoice as OpsBuyer approver"
+{backend.mcpToolPrefix}wit_get_work_item(project: <project.name from pipeline.config.json>, id: <tcId>, expand: "all")
+-> Title: "Approve order as Acme Portal approver"
 -> Steps:
-   1. Login to OpsBuyer as an invoice approver
-   2. Navigate to Invoice Summary via the left sidebar
-   3. Locate the invoice in Pending Approval status
+   1. Login to Acme Portal as an order approver
+   2. Navigate to Order Summary via the left sidebar
+   3. Locate the order in Pending Approval status
    4. Click Approve and confirm
-   5. Verify the invoice status changes to Approved
+   5. Verify the order status changes to Approved
    6. Logout
 ```
 
-**Step 2 — Resolve credentials from preview.properties:**
+**Step 2 — Resolve credentials from `pipeline.config.json`'s `apps` entry for Acme Portal:**
 ```
-Read: src/test/resources/env/preview.properties
--> base_web_url = https://opsbuyerpreview.example.realpage.com
--> env_username = QXV0b1Rlc3Q=   (base64)
--> env_password = <encoded>       (base64)
-Decode: username = AutoTest, password = ****
+apps entry: { "name": "Acme Portal", "urls": { "staging": "https://staging.acme.example.com" }, "credentialSource": "env:ACME_PORTAL_USER,ACME_PORTAL_PASS" }
+-> base_web_url = https://staging.acme.example.com
+-> Read env vars ACME_PORTAL_USER / ACME_PORTAL_PASS
+-> username = AutoTest, password = ****
 ```
 
 **PHASE 1 — Pre-Evaluation:**
 ```
 Step 1: Login — CLEAR (browser UI only)
 Step 2: Navigate — CLEAR (sidebar navigation, browser UI only)
-Step 3: Locate invoice — CLEAR (requires invoice in Pending status, described by role)
+Step 3: Locate order — CLEAR (requires order in Pending status, described by role)
 Step 4: Click Approve — CLEAR (browser UI only)
 Step 5: Verify status — CLEAR (browser snapshot)
 Step 6: Logout — CLEAR (browser UI only)
@@ -1938,7 +1860,7 @@ Step 6: Logout — CLEAR (browser UI only)
 
 **PHASE 2 — Step-by-step execution:**
 ```
-browser_navigate(url: "https://opsbuyerpreview.example.realpage.com")
+browser_navigate(url: "https://staging.acme.example.com")
 browser_snapshot() -> identify login form fields by ref
 browser_fill_form(fields: [{ref: eXX, value: "AutoTest"}, {ref: eYY, value: "****"}])
 browser_click(ref: <login_button_ref>)
@@ -1948,10 +1870,10 @@ browser_snapshot() -> Confirm dashboard heading visible, user tile shows "AutoTe
 
 browser_click(ref: <sidebar_menu_ref>)        // expand left nav if collapsed
 browser_snapshot()
-browser_click(ref: <invoice_summary_ref>)
-browser_wait_for(text: "Invoice Summary")
+browser_click(ref: <order_summary_ref>)
+browser_wait_for(text: "Order Summary")
 browser_snapshot()
--> Step 2: PASS (evidence: heading "Invoice Summary" visible ref=e88)
+-> Step 2: PASS (evidence: heading "Order Summary" visible ref=e88)
 
 [... continue per-step ...]
 
@@ -1962,7 +1884,7 @@ browser_take_screenshot(type: "png", filename: "{PROJECT_ROOT}/bunker/manual-tes
 ```
 Write: {PROJECT_ROOT}/bunker/manual-test-execution/TC_<tcId>/TC_<tcId>-execution-report.html
 (inject base64 screenshots per step via PowerShell)
-Report link: file:///C:/Users/username/SpendManagement_Automation_New/bunker/manual-test-execution/TC_<tcId>/TC_<tcId>-execution-report.html
+Report link: file:///C:/Users/username/my-automation-repo/bunker/manual-test-execution/TC_<tcId>/TC_<tcId>-execution-report.html
 ```
 
 **Step 7.5 — PDF:**

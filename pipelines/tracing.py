@@ -12,8 +12,8 @@ buys three things:
    builds the trace in memory, logs "No Confident AI API key found. Skipping trace posting."
    and writes NOTHING to disk. Tracing locally is therefore worthless without the sink below.
 3. **One place to control the destination.** Cloud export is explicitly opt-in and never
-   implied by an env var merely being present — these transcripts carry TFS work-item content,
-   PR diffs and live-app narration from a bypassPermissions run.
+   implied by an env var merely being present — these transcripts carry ticket content, PR
+   diffs and live-app narration from a bypassPermissions run.
 
 Symbols are imported INDIVIDUALLY rather than in one `from deepeval.tracing import a, b, c`.
 A single renamed symbol in a future deepeval release would make an atomic import raise, which
