@@ -542,6 +542,8 @@ Where `{OUTPUT_DIR}` = `bunker/manual-test-execution/<TYPE>_<workItemId>/`
 - Record the list of screenshot filenames in the TC's log entry (one per step)
 - These are embedded in the HTML report per step AND collected in the PDF
 
+**Pre-execution permission check:** before starting TC execution, confirm the screenshot tool actually works: `browser_take_screenshot(type: "png", filename: "{PROJECT_ROOT}/bunker/manual-test-execution/test_screenshot_check.png")`, then delete the test file. If this call is blocked by permissions, STOP and tell the user to add `mcp__playwright__browser_take_screenshot` to `settings.local.json`'s `permissions.allow` — don't discover this mid-suite.
+
 **CRITICAL — EXECUTION ORDER PER STEP (NON-NEGOTIABLE):**
 ```
 For EACH step:
@@ -1089,70 +1091,9 @@ The CSS for these classes (`.overall-result`, `.metrics`, `.metric`, `.metric.to
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Suite <suiteId> -- Suite Execution Report</title>
   <style>
-    :root {
-      --pass: #2e7d32; --pass-bg: #e8f5e9;
-      --fail: #c62828; --fail-bg: #ffebee;
-      --skip: #f57f17; --skip-bg: #fff8e1;
-      --blocked: #6a1b9a; --blocked-bg: #f3e5f5;
-      --border: #dee2e6;
-      --header-bg: #1a237e; --header-fg: #fff;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f6f9; color: #212529; line-height: 1.6; }
-    .container { max-width: 1050px; margin: 0 auto; padding: 24px 16px; }
-    .header { background: var(--header-bg); color: var(--header-fg); padding: 28px; border-radius: 10px 10px 0 0; }
-    .header h1 { font-size: 1.5rem; margin-bottom: 4px; }
-    .header .subtitle { opacity: .85; font-size: .9rem; }
-    .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0; background: #fff; border-bottom: 1px solid var(--border); }
-    .meta-grid .meta-item { padding: 10px 28px; border-bottom: 1px solid #f0f0f0; font-size: .9rem; }
-    .meta-grid .meta-item .label { color: #888; font-size: .78rem; text-transform: uppercase; letter-spacing: .4px; }
-    .meta-grid .meta-item .value { font-weight: 600; }
-    .meta-grid .meta-item .value a { color: var(--header-bg); text-decoration: none; }
-    .section { background: #fff; padding: 24px 28px; margin-top: 16px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
-    .section h2 { font-size: 1.15rem; margin-bottom: 14px; border-bottom: 2px solid var(--header-bg); padding-bottom: 6px; color: var(--header-bg); }
+    /* Same <style> block as the Single Test Case template above, plus these two rules: */
     .section h3 { font-size: 1rem; margin: 18px 0 10px; color: #37474f; }
-    .overall-result { text-align: center; padding: 18px; font-size: 1.3rem; font-weight: 700; border-radius: 8px; margin-top: 16px; }
-    .overall-result.pass { background: var(--pass-bg); color: var(--pass); }
-    .overall-result.fail { background: var(--fail-bg); color: var(--fail); }
-    .overall-result.partial { background: var(--skip-bg); color: var(--skip); }
-    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-top: 16px; }
-    .metric { text-align: center; padding: 14px 8px; border-radius: 8px; }
-    .metric .val { font-size: 1.8rem; font-weight: 700; }
-    .metric .lbl { font-size: .78rem; text-transform: uppercase; letter-spacing: .4px; color: #666; }
-    .metric.pass    { background: var(--pass-bg);    color: var(--pass); }
-    .metric.fail    { background: var(--fail-bg);    color: var(--fail); }
-    .metric.skip    { background: var(--skip-bg);    color: var(--skip); }
-    .metric.blocked { background: var(--blocked-bg); color: var(--blocked); }
-    .metric.total   { background: #e3f2fd;           color: #0d47a1; }
-    .metric.rate    { background: #e0f2f1;           color: #00695c; }
-    table { width: 100%; border-collapse: collapse; margin: 10px 0; }
-    th { background: #eceff1; text-align: left; padding: 10px 12px; font-size: .82rem; text-transform: uppercase; letter-spacing: .4px; color: #455a64; border-bottom: 2px solid var(--border); }
-    td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: .9rem; }
-    tr:hover td { background: #f5f7fa; }
-    .text-center { text-align: center; }
-    .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: .78rem; font-weight: 600; }
-    .badge-pass    { background: var(--pass-bg);    color: var(--pass); }
-    .badge-fail    { background: var(--fail-bg);    color: var(--fail); }
-    .badge-skip    { background: var(--skip-bg);    color: var(--skip); }
-    .badge-blocked { background: var(--blocked-bg); color: var(--blocked); }
-    .detail-box { background: #fff8f8; border-left: 4px solid var(--fail); padding: 16px; border-radius: 0 8px 8px 0; margin: 12px 0; }
-    .detail-box.skip-box    { background: #fffcf0; border-left-color: var(--skip); }
-    .detail-box.blocked-box { background: #faf5ff; border-left-color: var(--blocked); }
-    .detail-box table { margin: 0; }
-    .detail-box td:first-child { font-weight: 600; width: 160px; white-space: nowrap; }
-    .screenshot { margin: 16px 0; text-align: center; }
-    .screenshot img { max-width: 100%; border: 1px solid var(--border); border-radius: 6px; }
-    .step-row { border: 1px solid var(--border); border-radius: 6px; margin: 6px 0; overflow: hidden; }
-    .step-row summary { display: flex; align-items: center; padding: 10px 14px; cursor: pointer; list-style: none; background: #fafbfc; }
-    .step-row summary::-webkit-details-marker { display: none; }
-    .step-row summary::before { content: '\25B6'; font-size: .7rem; margin-right: 10px; color: #888; }
-    .step-row[open] summary::before { transform: rotate(90deg); }
-    .step-row .step-num { font-weight: 700; min-width: 36px; text-align: center; color: #455a64; }
-    .step-row .step-action { flex: 1; font-size: .9rem; }
-    .step-row .badge { margin-left: auto; flex-shrink: 0; }
-    .step-detail { padding: 0 14px 14px; }
     .tc-divider { border: none; border-top: 3px solid var(--header-bg); margin: 32px 0 16px; }
-    .footer { text-align: center; padding: 18px; font-size: .8rem; color: #999; margin-top: 24px; }
   </style>
 </head>
 <body>
@@ -1310,14 +1251,9 @@ The CSS for these classes (`.overall-result`, `.metrics`, `.metric`, `.metric.to
 
 **CRITICAL:** SKIP/BLOCKED TCs must NOT have individual step-by-step sections in the report body. They are ONLY listed in the segregated table above. Only EXECUTION-READY TCs that were actually executed get full step-by-step sections with screenshots.
 
-**Overall Result Logic:**
-- **PASS** — All steps passed
-- **FAIL** — A step failed
-- **PARTIAL** — Some steps passed, some skipped/blocked (no explicit failures)
-
 #### Screenshot-in-Report Enforcement (MANDATORY)
 
-**EVERY executed test case MUST have a `<div class="screenshot">` section with an `<img>` tag in the HTML report.** This applies to ALL outcomes — PASS, FAIL, SKIP, and BLOCKED.
+**EVERY executed test case MUST have a `<div class="screenshot">` section with an `<img>` tag in the HTML report.** This applies to ALL outcomes — PASS, FAIL, SKIP, and BLOCKED. If `browser_take_screenshot` is blocked mid-execution, retry with a different filename/path, then fall back to a `browser_evaluate(() => document.documentElement.outerHTML.substring(0, 500))` capture as evidence — never silently skip it. If a screenshot genuinely can't be captured, embed a visible placeholder instead of omitting the `<img>`: `<div style="background:#ffebee;padding:20px;text-align:center;border:2px dashed #c62828;">Screenshot not captured — permission blocked during execution</div>`.
 
 After creating the HTML file, run this validation:
 ```powershell
@@ -1598,7 +1534,9 @@ Run each command. If any produces unexpected output (missing file, 0 bytes, unre
 **Stage 2 — Completeness:**
 4. Verify the TC count in `summary.json` matches the count announced in Step 0.5 (or Step 1 for suite/TC modes)
 5. Verify every EXECUTION-READY TC has at least one step result (no TC remaining in `PENDING` state)
-6. Verify `summary.json` `selfVerification.issues` array is populated with any problems found
+6. Verify every executed TC has a non-null `playwrightScriptFile` in `summary.json`, and that the referenced `.spec.ts` file exists on disk with no invented selectors (every `page.locator(...)` traces back to a snapshot-observed element)
+7. Verify every SKIP/BLOCKED TC has its reason recorded in the Blocked/Skipped section
+8. Verify report paths presented to the user are full `file:///` URIs, execution log `endTime` is populated, and `summary.json` `selfVerification.issues` is populated with any problems found (empty array if none)
 
 **Report format for final output:**
 ```
@@ -1647,14 +1585,7 @@ Self-Verification: <PASSED / FAILED — list issues>
 - Navigation depth (single page or 10-page flow — same treatment)
 - Batch size (1 TC or 100 TCs — same treatment)
 
-**If a step fails due to a technical limitation (e.g., Angular form doesn't accept input):**
-1. Try `document.execCommand('insertText')` — works with Angular change detection
-2. Try `elementFromPoint(x, y)` to find the actual visible element
-3. Try Playwright's native `browser_type` with the element ref
-4. Try clicking the field first, then using keyboard `browser_press_key`
-5. Only after ALL approaches fail, mark the specific STEP as FAIL with the exact technical reason
-
-**NEVER mark an entire TC as FAIL just because one form interaction was difficult.** Try every approach first.
+**If a step fails due to a technical limitation (e.g., Angular form doesn't accept input), work through the fallback techniques in "Angular Form Interaction Techniques" below before marking the STEP as FAIL** — never mark an entire TC as FAIL just because one form interaction was difficult.
 
 **REQUIRED pattern:**
 - Execute TC steps -> record each step's actual result + evidence -> validate -> screenshot **immediately** -> write TC entry to execution_log JSON -> next TC
@@ -1670,47 +1601,20 @@ When executing multiple suites (comma-separated suiteIds):
 6. **BLOCKED TCs are recorded in the log immediately** (no execution needed) with blockedReason
 7. After ALL suites are executed, generate ALL reports (HTML + PDF + summary.json) for each suite
 
-### Always Wait for Page Load After EVERY Action (Minimum 2-3 Minutes Before Declaring Failure)
+### Wait / Snapshot / Validate — One Rule, Applied Everywhere
 
-After EVERY navigation, click, or form submission:
-1. Use `browser_wait_for(text: '<expected_text>')` or wait for a known element
-2. Take a `browser_snapshot()` after each wait
-3. **If the page appears to be loading, wait at least 2-3 minutes** with periodic snapshot checks (every 30 seconds) before concluding failure
-4. Try a page reload after 90 seconds if still stuck
-5. Only mark FAIL/BLOCKED after the full wait period
+This is the single canonical rule behind every "wait for page load," "post-action verification," and "fresh snapshot" instruction elsewhere in this file — Step 3 (login), Step 4 (per-step execution), and the Error Handling table all invoke it, they don't restate it:
 
-### No Hallucinated Results — Zero Tolerance
+**Pattern: action → wait → fresh snapshot → validate against the fresh snapshot. No step in this chain may be skipped, and no step in it may reuse data from before the action.**
 
-- **NEVER assume a step passed without actually verifying it in the browser**
-- **NEVER fabricate snapshot data or element states**
-- **NEVER mark PASS based on "the click was sent successfully"** — verify the RESULT
-- **NEVER reuse a previous snapshot for a new step's validation**
-- **Every PASS must cite specific evidence** — element ref, DOM value, URL, or text found
+1. After EVERY action (click, fill, navigate, select, press_key, evaluate-with-side-effects), wait for stabilization: `browser_wait_for(text: '<expected>')`, or a minimum of 3-5s if no specific text applies.
+2. If the page still appears to be loading (spinner, blank content, partial render), extend the wait up to 2-3 minutes total, re-snapshotting every 30s, with one reload attempt around the 60-90s mark. Only declare `TIMEOUT_OR_NO_RESPONSE` after the full wait is exhausted.
+3. Take a FRESH `browser_snapshot()` after the wait — never validate from a snapshot taken before the action, or from a previous step.
+4. Validate the actual page state changed as expected (click → element responded; fill → field holds the value; navigate → URL/title matches; select → option selected; press_key → form submitted/dialog closed). A Playwright call returning without error is NOT evidence — only the post-action snapshot is.
+5. If a validation is safety-critical and the snapshot result is ambiguous, follow up with `browser_evaluate()` for a definitive DOM check before deciding; if both are inconclusive, the step is FAIL, not PASS.
+6. If you're about to act without a prior snapshot confirming the current state, stop and take one first.
 
-### Double-Verification Rule
-
-For critical validations:
-1. First check via `browser_snapshot()`
-2. If not clearly confirmed, follow up with `browser_evaluate()` for a definitive DOM check
-3. Only mark PASS if at least ONE method returns a clear positive result
-4. If both methods are inconclusive, mark as FAIL
-
-### Post-Action Verification (MANDATORY -- ZERO EXCEPTIONS)
-
-After **every single action** (click, fill, navigate, select, press_key, evaluate-with-side-effects):
-1. **WAIT** for page to stabilize: `browser_wait_for(text: '<expected>')` or `browser_wait_for(time: 3)` minimum
-2. **SNAPSHOT**: Take a FRESH `browser_snapshot()` -- this is non-negotiable, every time, no shortcuts
-3. **VERIFY** the page state reflects the action was processed:
-   - After click: Did the target element respond? (page changed, menu opened, modal appeared)
-   - After fill: Does the field contain the entered value?
-   - After navigate: Does the URL/title match the expected page?
-   - After select: Is the option now selected?
-   - After press_key (Enter): Did the form submit, search trigger, or dialog close?
-   - After evaluate that triggers DOM changes: Did the DOM update as expected?
-4. If the page state did NOT change as expected, the action FAILED -- do not assume it worked
-5. **If you find yourself about to take an action without a prior snapshot confirming the current state -- STOP and take a snapshot first**
-
-**The pattern is always: snapshot -> action -> wait -> snapshot -> validate. No step in this chain may be skipped.**
+Every PASS must cite the specific fresh evidence (element ref, DOM value, URL, or text) that proves it — never fabricated, inferred, or reused from an earlier step.
 
 ### MCP Work-Item Backend Usage
 
@@ -1899,124 +1803,4 @@ Write: {OUTPUT_DIR}/TC_<tcId>-summary.json  (fully populated per spec)
 
 ---
 
-## STRICT ENFORCEMENT — NON-NEGOTIABLE RULES
-
-**ABSOLUTE RULE: Every instruction in this agent file MUST be followed strictly — no deviations, no shortcuts, no skipping rules, no partial compliance.** This agent file is the single source of truth for all execution behavior. When operating as the ManualTestExecutor agent, the executor MUST read, understand, and comply with EVERY rule documented here. Failure to follow ANY rule is an execution defect that invalidates the run.
-
-### 0. ALL Agent Flow Steps MUST Be Followed In Sequence
-
-The Core Workflow (Steps 0–9.5) defines the COMPLETE execution pipeline. **Every step MUST be executed in order.** No step may be skipped, abbreviated, or deferred to a later time:
-
-| Step | Name | Can Skip? |
-|------|------|-----------|
-| 0 | Parse User Input & Determine Execution Mode | **NO** |
-| 1 | Fetch Test Case Details from TFS | **NO** |
-| 2 | Determine Environment & Credentials | **NO** |
-| 3 | Login to the Application | **NO** |
-| 4 | Execute Each Test Step (Phase 1 + Phase 2) | **NO** |
-| 5 | Handle Failures — STOP Current TC, CONTINUE Suite | **NO** |
-| 6 | Logout | **NO** |
-| 7 | Generate Execution Report (HTML) | **NO** |
-| 7.5 | Generate PDF from HTML | **NO** |
-| 7.6 | Generate summary.json | **NO** |
-| 9.5 | Self-Verification (artifacts + completeness) | **NO** |
-
-**If any step cannot be completed** (e.g., tool permissions blocked, network errors), the agent MUST:
-1. **Report the failure to the user** with the specific step number and reason
-2. **NOT silently skip the step** and continue as if nothing happened
-3. **Retry if possible** (e.g., different approach, different tool)
-4. **Only after exhausting retries**, mark the step as incomplete and note it in the final report
-
-**CRITICAL:** Steps 7, 7.5, and 7.6 are post-execution steps that are frequently skipped or partially completed. These steps are JUST AS MANDATORY as the execution steps. A run without a proper HTML report, PDF, and summary.json is an INCOMPLETE run.
-
-**Every rule in this agent file is MANDATORY. The following rules have been violated in past executions and require explicit reinforcement. Failure to follow ANY of these is an execution defect.**
-
-### 1. Report File Path — ALWAYS Full `file:///` URI
-
-When presenting the report to the user at the END of execution, you MUST provide the full `file:///` URI. This is the ONLY acceptable format:
-
-```
-file:///C:/Users/username/SpendManagement_Automation_New/bunker/manual-test-execution/SUITE_2821792/SUITE_2821792-execution-report.html
-```
-
-**NEVER use:**
-- Relative paths: `bunker/manual-test-execution/TC_<id>/...html`
-- Markdown links with relative paths: `[report](bunker/manual-test-execution/...)`
-- Partial paths: `TC_<id>-execution-report.html` without the full absolute path
-- Windows backslash paths: `c:\Users\...\bunker\execution-reports\...`
-
-**How to construct:** Take the absolute path, replace all `\` with `/`, prefix with `file:///`.
-
-### 2. Screenshots — MANDATORY Per Test Case (ZERO EXCEPTIONS)
-
-Every executed test case MUST have exactly ONE screenshot taken IMMEDIATELY after the last step's validation, while the browser is still in the final validated state. Screenshots that are deferred, skipped, or batched are INVALID.
-
-**Screenshot auto-approval:** The `mcp__playwright__browser_take_screenshot` tool MUST be auto-approved without any user prompts or IDE confirmation dialogs. Ensure `settings.local.json` includes this tool in the `permissions.allow` array. If the IDE still prompts for approval, the user has confirmed that ALL screenshot calls should be automatically allowed — never pause execution for screenshot permission.
-
-**Screenshot capture is NOT optional.** If `browser_take_screenshot` is blocked by permissions, the agent MUST:
-1. Retry with a different filename/path
-2. If still blocked, use `browser_evaluate` to capture a base64 screenshot via JavaScript: `() => { return document.documentElement.outerHTML.substring(0, 500); }` as fallback evidence
-3. **NEVER silently skip the screenshot and continue** — a TC without a screenshot in the final report is an INCOMPLETE execution
-
-**Screenshot MUST appear in the HTML report:**
-- Each TC section in the HTML report MUST contain an `<img>` tag with the screenshot
-- Use base64 data URI embedding (Phase 1: placeholder `%%SCREENSHOT_BASE64%%`, Phase 2: PowerShell injection)
-- If screenshot file was saved to disk, embed it as base64 in the HTML
-- If screenshot could not be captured, include a visible placeholder: `<div style="background:#ffebee;padding:20px;text-align:center;border:2px dashed #c62828;">Screenshot not captured — permission blocked during execution</div>`
-- **NEVER generate an HTML report with zero screenshot `<img>` tags for executed TCs**
-
-**Pre-execution permission check (NEW — MANDATORY):**
-Before starting TC execution, verify screenshot capability:
-```
-browser_take_screenshot(type: "png", filename: "{PROJECT_ROOT}/bunker/manual-test-execution/test_screenshot_check.png")
-```
-If this fails, STOP and alert the user: "Screenshot tool is blocked by permissions. Update settings.local.json to allow `mcp__playwright__browser_take_screenshot` before proceeding."
-Delete the test file if it succeeds, then proceed with execution.
-
-### 3. Fresh Snapshot After EVERY Action
-
-The pattern `action → wait → snapshot → validate` is NON-NEGOTIABLE for every single step. Never validate from stale snapshot data or assume success because a Playwright call returned without error.
-
-### 4. FAIL Stops Current TC Only — Suite Continues
-
-When a step FAILs, STOP the current TC (mark remaining steps as "Not Run"), take the screenshot, then CONTINUE to the next TC. Never halt the entire suite.
-
-### 5. No Hallucinated Evidence
-
-Every PASS must cite specific evidence from a FRESH `browser_snapshot()` or `browser_evaluate()` taken AFTER the action. "The click was sent" is NOT evidence of success.
-
-### 6. Phase 1 Pre-Evaluation is MANDATORY Before Execution
-
-Read ALL steps of ALL test cases BEFORE executing ANY of them. Classify each TC as EXECUTION-READY, SKIP, or BLOCKED. Print the full execution plan. Only then proceed to Phase 2.
-
-### 7. All Three Output Artifacts are MANDATORY — Plus Playwright Scripts Written to Disk
-
-After all TCs are executed, you MUST produce all three artifacts before presenting the final summary:
-- HTML report (with per-step collapsible detail and embedded screenshots)
-- PDF report (from HTML via Node.js/Playwright — note if generation fails)
-- summary.json (fully populated with all TC/step/screenshot data AND Playwright script file references)
-
-**Playwright scripts written to disk are non-negotiable:**
-- Every EXECUTED TC → a `.spec.ts` file written to `{OUTPUT_DIR}/playwright-scripts/TC<id>-<slug>.spec.ts` using ACTUAL selectors from the browser snapshot
-- `testCases[N].playwrightScriptFile` in summary.json references the relative path to that file
-- Scripts are generated DURING execution as you record each step — capture the selector and interaction immediately after each `browser_snapshot()` call so nothing is lost
-- SKIPPED/BLOCKED TCs → `playwrightScriptFile: null`
-
-Never skip any of these. A run that produces only the HTML is INCOMPLETE. A summary.json without Playwright script file references is also INCOMPLETE.
-
-### 8. Self-Verification Before Final Output (Step 9.5)
-
-Run the two-stage self-verification defined in Step 9.5 before presenting the final summary:
-- [ ] HTML report exists on disk (size > 0)
-- [ ] PDF report exists on disk (size > 0, or note generation failure)
-- [ ] summary.json exists on disk and is valid JSON (size > 0)
-- [ ] No `%%SCREENSHOT_BASE64%%` placeholders remain in HTML
-- [ ] TC count in report matches announced count
-- [ ] Step screenshot count (`screenshots/` folder) matches `summary.json totalScreenshots`
-- [ ] Every executed TC has a non-null `playwrightScriptFile` in `summary.json` and the corresponding `.spec.ts` file exists on disk
-- [ ] No invented selectors — every `page.locator(...)` in generated scripts corresponds to a snapshot-observed element
-- [ ] Every SKIP/BLOCKED TC has its reason in the Blocked/Skipped section
-- [ ] Report paths presented to user are full `file:///` URIs (not relative, not backslash)
-- [ ] Execution log `endTime` is populated
-- [ ] `summary.json selfVerification.playwrightScriptsGenerated` = true if all executed TCs have a corresponding `.spec.ts` file on disk
-- [ ] `summary.json selfVerification.issues` is populated with any problems (empty array if none)
+**Screenshot auto-approval:** the `mcp__playwright__browser_take_screenshot` tool must be in `settings.local.json`'s `permissions.allow` array so it never prompts mid-execution (see "Zero-Interruption Execution Policy" above).
