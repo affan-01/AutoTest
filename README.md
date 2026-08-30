@@ -1,4 +1,4 @@
-# QA pipeline — two ways to run
+# AutoTest — two ways to run
 
 A generic, PM-tool-agnostic QA pipeline template with no application knowledge baked in, plus a
 web dashboard for configuring it and browsing pipeline results.
